@@ -4,9 +4,11 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Prompt
 from rich.panel import Panel
+from rich.text import Text
 
 from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache, load_favorites, save_favorite, is_favorite
 from ui.components import create_model_table
+from ui.effects import create_gradient_text, create_glass_panel
 
 
 class DiscoveryView:
@@ -28,10 +30,11 @@ class DiscoveryView:
         Returns:
             Tuple of (server_dict, model_name)
         """
-        # Show title
+        # Show title with gradient
         self.console.print()
+        title = create_gradient_text("✨ MODEL DISCOVERY ✨", ['cyan', 'bright_cyan', 'blue', 'bright_blue'])
         self.console.print(
-            Panel("[bold cyan]Model Discovery[/bold cyan]", style="title"),
+            create_glass_panel(title, accent_color="cyan"),
             justify="center"
         )
         self.console.print()

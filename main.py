@@ -6,10 +6,11 @@ import asyncio
 from enum import Enum
 from rich.console import Console
 
-from ui.theme import APP_THEME
+from ui.theme import get_theme, load_theme
 from ui.discovery import DiscoveryView
 from ui.chat import ChatView
 from ui.stress_test import StressTestView
+from ui.effects import create_banner, animate_banner_fade
 
 
 class AppState(Enum):
@@ -25,14 +26,25 @@ class ModelChatCLI:
 
     def __init__(self):
         """Initialize the CLI application."""
-        self.console = Console(theme=APP_THEME)
+        # Load theme preference
+        theme_name = load_theme()
+        current_theme = get_theme(theme_name)
+        self.console = Console(theme=current_theme)
         self.state = AppState.DISCOVERY
         self.selected_server = None
         self.selected_model = None
+        self.show_banner = True  # Show banner on first run
 
     async def run(self):
         """Run the main application loop."""
         try:
+            # Show animated banner on first run
+            if self.show_banner:
+                banner = create_banner("MODEL CHAT CLI", font="slant")
+                await animate_banner_fade(self.console, banner, duration=0.8)
+                self.show_banner = False
+                await asyncio.sleep(0.5)
+
             while self.state != AppState.QUIT:
                 if self.state == AppState.DISCOVERY:
                     await self._discovery_mode()

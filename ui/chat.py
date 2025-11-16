@@ -12,6 +12,14 @@ from prompt_toolkit.formatted_text import HTML
 
 from client import ModelClient
 from ui.components import create_chat_message, create_header, create_footer, create_typing_indicator
+from ui.effects import (
+    create_sparkline,
+    create_glass_panel,
+    create_status_bar,
+    create_confetti,
+    create_particle_burst
+)
+from ui.theme import list_themes, save_theme, get_theme
 
 
 class ChatView:
@@ -92,10 +100,19 @@ class ChatView:
                 self.message_metadata.append(user_metadata)
                 user_msg = create_chat_message("user", user_input, metadata=user_metadata, show_metadata=self.show_timestamps)
                 self.all_messages.append(user_msg)
+
+                # Show particle burst effect when sending message
+                particles = Text(create_particle_burst("✨", count=15), style="cyan dim")
+                self.all_messages.append(particles)
+
                 self._refresh_display()
 
                 # Stream assistant response
                 await self._stream_response(user_input)
+
+                # Remove particle effect after response
+                if particles in self.all_messages:
+                    self.all_messages.remove(particles)
 
             except KeyboardInterrupt:
                 # Ctrl+C - ask if they want to quit or go back
@@ -324,6 +341,38 @@ class ChatView:
                 self.console.print("[warning]No assistant message to regenerate[/warning]")
                 self.console.print()
 
+        elif cmd =="/theme":
+            # Theme selection
+            themes = list_themes()
+            self.console.print("\n[bold cyan]Available Themes:[/bold cyan]\n")
+
+            for i, theme_name in enumerate(themes, 1):
+                self.console.print(f"  [{i}] {theme_name}")
+
+            self.console.print()
+            choice = await self.session.prompt_async(HTML('<ansiblue>Select theme (number or name): </ansiblue>'))
+            choice = choice.strip()
+
+            if choice.isdigit() and 1 <= int(choice) <= len(themes):
+                theme_name = themes[int(choice) - 1]
+            elif choice in themes:
+                theme_name = choice
+            else:
+                self.console.print("[error]Invalid theme selection[/error]")
+                self.console.print()
+                return "continue"
+
+            # Save and apply theme
+            save_theme(theme_name)
+            new_theme = get_theme(theme_name)
+            self.console = Console(theme=new_theme)
+            self.console.print(f"[success]Theme changed to '{theme_name}'! Restart for full effect.[/success]")
+
+            # Show celebration
+            confetti = create_confetti()
+            self.console.print(confetti)
+            self.console.print()
+
         elif cmd == "/compare":
             # Compare responses from multiple models
             self.console.print("[bold cyan]Model Comparison Mode[/bold cyan]")
@@ -475,6 +524,7 @@ class ChatView:
 /edit <num>     - Edit and resend a user message
 /history        - View conversation history
 /compare        - Compare model responses (experimental)
+/theme          - Change color theme
 /help           - Show this help message
 
 [bold]Keyboard Shortcuts:[/bold]
@@ -496,25 +546,37 @@ Alt+Enter       - Send message (in multiline mode)
         return "continue"
 
     def _create_header_panel(self) -> Panel:
-        """Create the header panel with current stats."""
+        """Create the header panel with current stats and sparklines."""
         server_addr = f"{self.server['ip']}:{self.server['port']}"
 
-        # Create header text
-        header_text = Text()
-        header_text.append("┃ ", style="bold blue")
-        header_text.append(self.model, style="bold cyan")
-        header_text.append(" @ ", style="dim")
-        header_text.append(server_addr, style="dim magenta")
+        # Create status bar with icons
+        health = "good" if self.avg_tps > 50 else "medium" if self.avg_tps > 20 else "poor"
+        status_bar = create_status_bar(
+            server=server_addr,
+            tps=self.avg_tps,
+            messages=len(self.history),
+            health=health if self.avg_tps > 0 else "good"
+        )
 
-        if self.avg_tps > 0:
-            header_text.append(" │ ", style="dim")
-            header_text.append(f"{self.avg_tps:.1f}", style="bold yellow")
-            header_text.append(" tok/s", style="dim")
+        # Create sparkline for TPS history
+        sparkline = ""
+        if len(self.tps_samples) > 1:
+            sparkline = create_sparkline(self.tps_samples, width=20)
+            sparkline_text = Text()
+            sparkline_text.append("\n⚡ TPS: ", style="dim")
+            sparkline_text.append(sparkline, style="yellow")
+        else:
+            sparkline_text = Text()
 
-        header_text.append(" ┃", style="bold blue")
+        # Combine model name and status
+        header_content = Group(
+            Text(f"✨ {self.model}", style="bold cyan"),
+            status_bar,
+            sparkline_text if sparkline else Text("")
+        )
 
-        # Return panel
-        return Panel(header_text, style="on #1e293b", border_style="blue", padding=(0, 1))
+        # Return glassmorphism-style panel
+        return create_glass_panel(header_content, accent_color="cyan")
 
     def _refresh_display(self):
         """Refresh the display with header at top and all messages below."""
