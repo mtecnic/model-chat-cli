@@ -5,7 +5,7 @@ A modern terminal interface for discovering and chatting with local AI models.
 ## Features
 
 - **Auto-Discovery**: Automatically scans your local network for AI model servers
-- **Multi-Format Support**: Works with both OpenAI-compatible APIs and Ollama
+- **Multi-Format Support**: Works with both OpenAI-compatible APIs, vllm and Ollama
 - **Modern UI**: 24-bit color gradients and contemporary design
 - **Streaming Responses**: Real-time streaming chat responses
 - **Health Checks**: Shows server status and response times
