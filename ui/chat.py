@@ -22,6 +22,8 @@ from ui.effects import (
 )
 from ui.theme import list_themes, save_theme, get_theme
 from utils.token_estimator import estimate_tokens, estimate_response_tokens
+from utils.conversation_manager import conversation_manager
+from utils.context_manager import ContextManager
 
 
 class ChatView:
@@ -51,6 +53,9 @@ class ChatView:
 
         # System prompt
         self.system_prompt = ""  # Optional system prompt
+
+        # Context window management
+        self.context_manager = ContextManager(model=model)
 
         # Multiline mode
         self.multiline_mode = False
@@ -105,6 +110,23 @@ class ChatView:
 
                 # Enforce memory limits
                 self._enforce_memory_limits()
+
+                # Check and trim context window if needed
+                if self.context_manager.should_trim(self.history, self.system_prompt):
+                    trimmed_history, removed_count = self.context_manager.trim_history(
+                        self.history,
+                        self.system_prompt,
+                        keep_recent=20
+                    )
+                    if removed_count > 0:
+                        self.history = trimmed_history
+                        # Also trim message_metadata to match
+                        self.message_metadata = self.message_metadata[-len(self.history):]
+                        self._rebuild_messages()
+                        self.console.print(
+                            f"[yellow]⚠ Context window approaching limit. "
+                            f"Trimmed {removed_count} older messages.[/yellow]"
+                        )
 
                 # Show particle burst effect when sending message
                 particles = Text(create_particle_burst("✨", count=15), style="cyan dim")
@@ -271,6 +293,62 @@ class ChatView:
                 self.console.print(f"[success]Conversation exported to {filename}[/success]")
             self.console.print()
 
+        elif cmd == "/save":
+            # Save conversation with conversation_manager
+            if not self.history:
+                self.console.print("[warning]No conversation to save[/warning]")
+            else:
+                parts = command.split(maxsplit=1)
+                name = parts[1] if len(parts) > 1 else None
+
+                conv_id = conversation_manager.save_conversation(
+                    history=self.history,
+                    server=self.server,
+                    model=self.model,
+                    metadata={"tps_samples": self.tps_samples, "avg_tps": self.avg_tps},
+                    name=name
+                )
+                self.console.print(f"[success]Conversation saved as: {conv_id}[/success]")
+            self.console.print()
+
+        elif cmd == "/load":
+            # Load conversation from conversation_manager
+            parts = command.split()
+            if len(parts) < 2:
+                # Show list of available conversations
+                conversations = conversation_manager.list_conversations(limit=10)
+                if not conversations:
+                    self.console.print("[warning]No saved conversations found[/warning]")
+                else:
+                    self.console.print("[bold]Recent Conversations:[/bold]")
+                    for i, conv in enumerate(conversations, 1):
+                        date = conv['created_at'][:19].replace('T', ' ')
+                        self.console.print(
+                            f"  {i}. [cyan]{conv['id']}[/cyan] - {conv['model']} "
+                            f"({conv['message_count']} msgs) - {date}"
+                        )
+                    self.console.print("\n[dim]Usage: /load <conversation_id>[/dim]")
+            else:
+                conv_id = parts[1]
+                conversation = conversation_manager.load_conversation(conv_id)
+
+                if not conversation:
+                    self.console.print(f"[error]Conversation not found: {conv_id}[/error]")
+                else:
+                    # Load the conversation
+                    self.history = conversation['history']
+                    self.message_metadata = [{} for _ in self.history]  # Reset metadata
+
+                    # Rebuild display
+                    self._rebuild_messages()
+                    self._refresh_display()
+
+                    self.console.print(
+                        f"[success]Loaded conversation: {conv_id} "
+                        f"({len(self.history)} messages)[/success]"
+                    )
+            self.console.print()
+
         elif cmd == "/system":
             # Handle system prompt
             await self._handle_system_prompt()
@@ -344,6 +422,29 @@ class ChatView:
             else:
                 self.console.print("[warning]No assistant message to regenerate[/warning]")
                 self.console.print()
+
+        elif cmd == "/context":
+            # Show context window status
+            status = self.context_manager.get_context_status(self.history, self.system_prompt)
+            context_info = self.context_manager.format_context_info(self.history, self.system_prompt)
+
+            self.console.print(Panel(
+                f"""{context_info}
+
+[bold]Details:[/bold]
+• Current tokens: {status['current_tokens']:,}
+• Maximum tokens: {status['max_tokens']:,}
+• Effective limit: {status['effective_limit']:,} (with {self.context_manager.reserve_tokens} reserved)
+• Remaining: {status['remaining_tokens']:,}
+• Usage: {status['usage_ratio']*100:.1f}%
+• Status: {status['status'].upper()}
+
+[dim]Note: Auto-trimming occurs at 100% usage to keep recent messages.[/dim]
+                """,
+                title="Context Window Status",
+                border_style="cyan" if status['status'] == 'ok' else "yellow" if status['status'] == 'warning' else "red"
+            ))
+            self.console.print()
 
         elif cmd == "/theme":
             # Theme selection
@@ -517,6 +618,8 @@ class ChatView:
 /quit, /q       - Exit the chat
 /switch         - Switch to a different model
 /clear          - Clear conversation history
+/save [name]    - Save conversation to disk
+/load [id]      - Load a saved conversation
 /export         - Export conversation to markdown
 /system         - View/edit system prompt
 /stress         - Run stress tests on the model server
@@ -526,6 +629,7 @@ class ChatView:
 /regenerate     - Regenerate last assistant response
 /edit <num>     - Edit and resend a user message
 /history        - View conversation history
+/context        - View context window status
 /compare        - Compare model responses (experimental)
 /theme          - Change color theme
 /help           - Show this help message
@@ -571,11 +675,19 @@ Alt+Enter       - Send message (in multiline mode)
         else:
             sparkline_text = Text()
 
+        # Get context status
+        context_info_text = Text()
+        if self.history:
+            context_info_str = self.context_manager.format_context_info(self.history, self.system_prompt)
+            context_info_text.append("\n")
+            context_info_text.append_text(Text.from_markup(context_info_str))
+
         # Combine model name and status
         header_content = Group(
             Text(f"✨ {self.model}", style="bold cyan"),
             status_bar,
-            sparkline_text if sparkline else Text("")
+            sparkline_text if sparkline else Text(""),
+            context_info_text if self.history else Text("")
         )
 
         # Return glassmorphism-style panel
