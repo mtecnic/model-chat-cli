@@ -7,15 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import httpx
 
-
-# Common ports for local AI model servers
-COMMON_PORTS = [
-    11434,  # Ollama
-    1234,   # LM Studio
-    5000,   # Flask/Custom servers
-    8000,   # FastAPI/Custom servers
-    8080,   # Alternative HTTP
-]
+from config import config
 
 
 async def check_endpoint(client: httpx.AsyncClient, url: str, endpoint: str) -> Optional[Dict]:
@@ -69,8 +61,16 @@ async def probe_server(ip: str, port: int, client: httpx.AsyncClient, semaphore:
         return None
 
 
-async def scan_network(progress_callback=None) -> List[Dict]:
-    """Scan the local network for AI model servers."""
+async def scan_network(progress_callback=None, timeout: float = 30.0) -> List[Dict]:
+    """Scan the local network for AI model servers.
+
+    Args:
+        progress_callback: Optional callback for progress updates
+        timeout: Maximum time in seconds for entire scan (default: 30s)
+
+    Returns:
+        List of discovered servers
+    """
     # Get local IP to determine subnet
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -84,34 +84,57 @@ async def scan_network(progress_callback=None) -> List[Dict]:
     subnet = ".".join(local_ip.split(".")[:3])
 
     # Create shared resources for all probes
-    semaphore = asyncio.Semaphore(100)  # Limit concurrent probes to 100
+    semaphore = asyncio.Semaphore(50)  # Reduced from 100 to 50 for better stability
 
-    # Shared HTTP client with increased connection limits
-    limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
-    async with httpx.AsyncClient(limits=limits) as client:
-        # Generate all IP:port combinations to check
-        tasks = []
-        total = 255 * len(COMMON_PORTS)
-        current = 0
+    # Shared HTTP client with timeouts and connection limits
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=25)
+    timeout_config = httpx.Timeout(2.0, connect=1.0)  # 2s total, 1s connect
 
-        for i in range(1, 256):
-            ip = f"{subnet}.{i}"
-            for port in COMMON_PORTS:
-                tasks.append(probe_server(ip, port, client, semaphore))
+    try:
+        async with httpx.AsyncClient(limits=limits, timeout=timeout_config) as client:
+            # Generate all IP:port combinations to check
+            tasks = []
+            total = 255 * len(config.COMMON_PORTS)
+            current = 0
 
-        # Execute all probes concurrently (limited by semaphore)
-        servers = []
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            current += 1
+            for i in range(1, 256):
+                ip = f"{subnet}.{i}"
+                for port in config.COMMON_PORTS:
+                    tasks.append(probe_server(ip, port, client, semaphore))
 
-            if progress_callback:
-                await progress_callback(current, total)
+            # Execute all probes concurrently with overall timeout
+            servers = []
 
-            if result:
-                # Add basic health info (will be validated properly later if needed)
-                result["status"] = "discovered"
-                servers.append(result)
+            try:
+                # Wrap in wait_for to enforce overall timeout
+                async with asyncio.timeout(timeout):  # Python 3.11+ syntax
+                    for coro in asyncio.as_completed(tasks):
+                        try:
+                            result = await coro
+                            current += 1
+
+                            if progress_callback:
+                                await progress_callback(current, total)
+
+                            if result:
+                                # Add basic health info
+                                result["status"] = "discovered"
+                                servers.append(result)
+                        except Exception:
+                            # Skip failed individual probes
+                            current += 1
+                            if progress_callback:
+                                await progress_callback(current, total)
+                            continue
+            except asyncio.TimeoutError:
+                # Scan timeout reached, return what we have
+                pass
+
+    except Exception as e:
+        # Client creation or other fatal error
+        import logging
+        logging.error(f"Network scan failed: {e}")
+        return []
 
     return servers
 
@@ -144,15 +167,10 @@ async def check_server_health(server: Dict) -> Dict:
         }
 
 
-# Cache file location
-CACHE_FILE = Path.home() / ".model_chat_cache.json"
-FAVORITES_FILE = Path.home() / ".model_chat_favorites.json"
-
-
 def save_cache(servers: List[Dict]) -> None:
     """Save discovered servers to cache file."""
     try:
-        with open(CACHE_FILE, 'w') as f:
+        with open(config.CACHE_FILE, 'w') as f:
             json.dump(servers, f, indent=2)
     except Exception:
         pass  # Silently fail if cache can't be saved
@@ -161,8 +179,8 @@ def save_cache(servers: List[Dict]) -> None:
 def load_cache() -> Optional[List[Dict]]:
     """Load servers from cache file."""
     try:
-        if CACHE_FILE.exists():
-            with open(CACHE_FILE, 'r') as f:
+        if config.CACHE_FILE.exists():
+            with open(config.CACHE_FILE, 'r') as f:
                 return json.load(f)
     except Exception:
         pass  # Silently fail if cache can't be loaded
@@ -188,7 +206,7 @@ def save_favorite(server: Dict, model: str) -> None:
     favorites.append(favorite)
 
     try:
-        with open(FAVORITES_FILE, 'w') as f:
+        with open(config.FAVORITES_FILE, 'w') as f:
             json.dump(favorites, f, indent=2)
     except Exception:
         pass
@@ -197,8 +215,8 @@ def save_favorite(server: Dict, model: str) -> None:
 def load_favorites() -> List[Dict]:
     """Load favorites from file."""
     try:
-        if FAVORITES_FILE.exists():
-            with open(FAVORITES_FILE, 'r') as f:
+        if config.FAVORITES_FILE.exists():
+            with open(config.FAVORITES_FILE, 'r') as f:
                 return json.load(f)
     except Exception:
         pass
@@ -211,7 +229,7 @@ def remove_favorite(server_url: str, model: str) -> None:
     favorites = [f for f in favorites if not (f["server"]["url"] == server_url and f["model"] == model)]
 
     try:
-        with open(FAVORITES_FILE, 'w') as f:
+        with open(config.FAVORITES_FILE, 'w') as f:
             json.dump(favorites, f, indent=2)
     except Exception:
         pass

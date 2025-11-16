@@ -3,6 +3,8 @@ from rich.theme import Theme
 from pathlib import Path
 import json
 
+from config import config as app_config
+
 # ============================================================================
 # THEME PRESETS
 # ============================================================================
@@ -159,9 +161,6 @@ THEMES = {
 # Default theme
 APP_THEME = THEMES["default"]
 
-# Theme configuration file
-THEME_CONFIG_FILE = Path.home() / ".model_chat_theme.json"
-
 
 def load_theme() -> str:
     """Load saved theme preference.
@@ -170,10 +169,10 @@ def load_theme() -> str:
         Theme name
     """
     try:
-        if THEME_CONFIG_FILE.exists():
-            with open(THEME_CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-                return config.get("theme", "default")
+        if app_config.THEME_FILE.exists():
+            with open(app_config.THEME_FILE, 'r') as f:
+                theme_config = json.load(f)
+                return theme_config.get("theme", "default")
     except Exception:
         pass
     return "default"
@@ -186,7 +185,7 @@ def save_theme(theme_name: str):
         theme_name: Name of theme to save
     """
     try:
-        with open(THEME_CONFIG_FILE, 'w') as f:
+        with open(app_config.THEME_FILE, 'w') as f:
             json.dump({"theme": theme_name}, f)
     except Exception:
         pass

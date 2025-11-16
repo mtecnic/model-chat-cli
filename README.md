@@ -46,6 +46,39 @@ python main.py
 - Python 3.8+
 - Modern terminal with 24-bit color support
 
+## Configuration
+
+Model Chat CLI supports environment variable configuration. All settings have sensible defaults.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_CHAT_COMMON_PORTS` | `11434,1234,5000,8000,8080` | Comma-separated list of ports to scan |
+| `MODEL_CHAT_SCAN_TIMEOUT` | `30.0` | Network scan timeout in seconds |
+| `MODEL_CHAT_SCAN_SEMAPHORE` | `50` | Max concurrent network probes |
+| `MODEL_CHAT_CACHE_FILE` | `~/.model_chat_cache.json` | Server cache file path |
+| `MODEL_CHAT_THEME_FILE` | `~/.model_chat_theme.json` | Theme preference file |
+| `MODEL_CHAT_FAVORITES_FILE` | `~/.model_chat_favorites.json` | Favorites file path |
+| `MODEL_CHAT_MAX_HISTORY` | `1000` | Max messages in chat history |
+| `MODEL_CHAT_MAX_DISPLAY` | `100` | Max messages to display |
+| `MODEL_CHAT_MAX_RETRIES` | `3` | Network retry attempts |
+| `MODEL_CHAT_RETRY_BASE_DELAY` | `1.0` | Base retry delay in seconds |
+| `MODEL_CHAT_RETRY_MAX_DELAY` | `8.0` | Max retry delay in seconds |
+| `MODEL_CHAT_ENABLE_BANNER` | `true` | Show startup banner |
+| `MODEL_CHAT_BANNER_FONT` | `slant` | ASCII art banner font |
+| `MODEL_CHAT_DEFAULT_THEME` | `default` | Default color theme |
+| `MODEL_CHAT_LOG_LEVEL` | `INFO` | Logging level |
+
+### Example
+
+```bash
+# Customize scan timeout and ports
+export MODEL_CHAT_SCAN_TIMEOUT=60.0
+export MODEL_CHAT_COMMON_PORTS="11434,1234,8000"
+python main.py
+```
+
 ## Architecture
 
 ```

@@ -6,6 +6,7 @@ import asyncio
 from enum import Enum
 from rich.console import Console
 
+from config import config
 from ui.theme import get_theme, load_theme
 from ui.discovery import DiscoveryView
 from ui.chat import ChatView
@@ -33,15 +34,15 @@ class ModelChatCLI:
         self.state = AppState.DISCOVERY
         self.selected_server = None
         self.selected_model = None
-        self.show_banner = True  # Show banner on first run
+        self.show_banner = config.ENABLE_BANNER  # Show banner based on config
 
     async def run(self):
         """Run the main application loop."""
         try:
             # Show animated banner on first run
             if self.show_banner:
-                banner = create_banner("MODEL CHAT CLI", font="slant")
-                await animate_banner_fade(self.console, banner, duration=0.8)
+                banner = create_banner("MODEL CHAT CLI", font=config.BANNER_FONT)
+                await animate_banner_fade(self.console, banner, duration=config.BANNER_DURATION)
                 self.show_banner = False
                 await asyncio.sleep(0.5)
 

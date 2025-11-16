@@ -11,6 +11,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import HTML
 
 from client import ModelClient
+from config import config
 from ui.components import create_chat_message, create_header, create_footer, create_typing_indicator
 from ui.effects import (
     create_sparkline,
@@ -20,6 +21,7 @@ from ui.effects import (
     create_particle_burst
 )
 from ui.theme import list_themes, save_theme, get_theme
+from utils.token_estimator import estimate_tokens, estimate_response_tokens
 
 
 class ChatView:
@@ -101,6 +103,9 @@ class ChatView:
                 user_msg = create_chat_message("user", user_input, metadata=user_metadata, show_metadata=self.show_timestamps)
                 self.all_messages.append(user_msg)
 
+                # Enforce memory limits
+                self._enforce_memory_limits()
+
                 # Show particle burst effect when sending message
                 particles = Text(create_particle_burst("✨", count=15), style="cyan dim")
                 self.all_messages.append(particles)
@@ -147,8 +152,7 @@ class ChatView:
         interrupted = False
 
         # Estimate response tokens (assume similar to prompt length, with multiplier)
-        prompt_tokens = self._estimate_tokens(message)
-        estimated_response_tokens = int(prompt_tokens * 1.5)  # Responses typically 1.5x prompt length
+        estimated_response_tokens = estimate_response_tokens(message)
 
         # Show typing indicator with estimate
         typing_panel = create_typing_indicator(estimated_response_tokens, self.avg_tps)
@@ -169,7 +173,7 @@ class ChatView:
                     async for chunk in self.client.chat_stream(message, messages_with_system):
                         full_response += chunk
                         # Improved token estimation
-                        token_count = self._estimate_tokens(full_response)
+                        token_count = estimate_tokens(full_response)
                         # Update display with current response
                         live.update(create_chat_message("assistant", full_response))
                 except (asyncio.CancelledError, KeyboardInterrupt):
@@ -341,7 +345,7 @@ class ChatView:
                 self.console.print("[warning]No assistant message to regenerate[/warning]")
                 self.console.print()
 
-        elif cmd =="/theme":
+        elif cmd == "/theme":
             # Theme selection
             themes = list_themes()
             self.console.print("\n[bold cyan]Available Themes:[/bold cyan]\n")
@@ -362,11 +366,10 @@ class ChatView:
                 self.console.print()
                 return "continue"
 
-            # Save and apply theme
+            # Save theme preference (will apply on next view/restart)
             save_theme(theme_name)
-            new_theme = get_theme(theme_name)
-            self.console = Console(theme=new_theme)
-            self.console.print(f"[success]Theme changed to '{theme_name}'! Restart for full effect.[/success]")
+            self.console.print(f"[success]Theme '{theme_name}' saved! Restart or switch views to apply.[/success]")
+            self.console.print("[dim]Theme changes apply when you restart or return to the main menu.[/dim]")
 
             # Show celebration
             confetti = create_confetti()
@@ -405,7 +408,7 @@ class ChatView:
                     live.update(create_chat_message("assistant", response))
 
             duration = time.time() - start
-            tokens = self._estimate_tokens(response)
+            tokens = estimate_tokens(response)
             tps = tokens / duration if duration > 0 else 0
 
             # Show comparison result
@@ -606,6 +609,23 @@ Alt+Enter       - Send message (in multiline mode)
         # Show command palette footer
         self._show_command_palette()
 
+    def _enforce_memory_limits(self):
+        """Enforce memory limits on history and display messages."""
+        # Limit total history size
+        if len(self.history) > config.MAX_HISTORY_MESSAGES:
+            # Keep last N messages
+            trim_count = len(self.history) - config.MAX_HISTORY_MESSAGES
+            self.history = self.history[trim_count:]
+            self.message_metadata = self.message_metadata[trim_count:]
+
+            # Rebuild display from trimmed history
+            self._rebuild_messages()
+
+        # Limit display messages (keep last N for performance)
+        if len(self.all_messages) > config.MAX_DISPLAY_MESSAGES:
+            # Only show recent messages
+            self.all_messages = self.all_messages[-config.MAX_DISPLAY_MESSAGES:]
+
     def _show_command_palette(self):
         """Show command palette footer with available commands."""
         from rich.text import Text
@@ -644,51 +664,6 @@ Alt+Enter       - Send message (in multiline mode)
         footer.append("Help", style="dim")
 
         self.console.print(Panel(footer, style="on #0f172a", border_style="dim blue", padding=(0, 1)))
-
-    def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count using improved heuristics.
-
-        Better than simple char/4, accounts for:
-        - Word boundaries (spaces create tokens)
-        - Punctuation (often separate tokens)
-        - Numbers (compact tokenization)
-        - Code patterns (more tokens per char)
-
-        Target: Within 10-15% of actual tokens
-
-        Args:
-            text: Text to estimate tokens for
-
-        Returns:
-            Estimated token count
-        """
-        if not text:
-            return 0
-
-        # Count different components
-        words = text.split()
-        word_count = len(words)
-
-        # Count special characters (punctuation, symbols)
-        special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
-
-        # Count newlines (often separate tokens)
-        newline_count = text.count('\n')
-
-        # Estimate based on multiple factors:
-        # - Base: ~1.3 tokens per word (accounts for subword tokenization)
-        # - Punctuation: ~0.5 tokens each (some merge with words)
-        # - Newlines: 1 token each
-        # - Adjustment for very short words (more tokens per char)
-
-        token_estimate = (
-            word_count * 1.3 +           # Words with subword splits
-            special_chars * 0.5 +        # Punctuation/symbols
-            newline_count * 1.0          # Newlines
-        )
-
-        # Clamp minimum to prevent zero/negative
-        return max(1, int(token_estimate))
 
     def _build_message_history(self) -> list:
         """Build message history with system prompt if set.

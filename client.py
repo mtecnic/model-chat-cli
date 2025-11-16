@@ -2,6 +2,11 @@
 from typing import AsyncGenerator, Dict, Optional
 import httpx
 import json
+import logging
+
+from config import config
+
+logger = logging.getLogger(__name__)
 
 
 class ModelClient:
