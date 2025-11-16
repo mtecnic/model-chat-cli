@@ -53,17 +53,22 @@ def create_model_table(servers: list) -> Table:
     return table
 
 
-def create_chat_message(role: str, content: str, highlight_code: bool = True) -> Panel:
-    """Create a Rich Panel for a chat message with optional code highlighting.
+def create_chat_message(role: str, content: str, highlight_code: bool = True, metadata: dict = None, show_metadata: bool = False) -> Panel:
+    """Create a Rich Panel for a chat message with optional code highlighting and metadata.
 
     Args:
         role: Message role ("user" or "assistant")
         content: Message content
         highlight_code: Whether to highlight code blocks
+        metadata: Optional metadata dict with keys: timestamp, tokens, tps, duration
+        show_metadata: Whether to display metadata
 
     Returns:
         Rich Panel formatted as a chat message
     """
+    from rich.text import Text
+    import datetime
+
     style = "chat.user" if role == "user" else "chat.assistant"
     border = "blue" if role == "user" else "green"
 
@@ -73,9 +78,28 @@ def create_chat_message(role: str, content: str, highlight_code: bool = True) ->
     else:
         renderable = content
 
+    # Build title with optional metadata
+    title = Text()
+    title.append(f"{role.upper()}", style=style)
+
+    if show_metadata and metadata:
+        title.append(" ", style="dim")
+        if "timestamp" in metadata:
+            ts = datetime.datetime.fromtimestamp(metadata["timestamp"])
+            title.append(f"[{ts.strftime('%H:%M:%S')}]", style="dim")
+
+        if "tokens" in metadata and metadata["tokens"] > 0:
+            title.append(f"  📊 {metadata['tokens']} tok", style="dim cyan")
+
+        if "tps" in metadata and metadata["tps"] > 0:
+            title.append(f"  ⚡ {metadata['tps']:.0f} tok/s", style="dim yellow")
+
+        if "duration" in metadata and metadata["duration"] > 0:
+            title.append(f"  ⏱ {metadata['duration']:.1f}s", style="dim magenta")
+
     return Panel(
         renderable,
-        title=f"[{style}]{role.upper()}[/{style}]",
+        title=title,
         border_style=border,
         padding=(0, 1)
     )
@@ -154,14 +178,30 @@ def create_footer(message: str) -> Panel:
     return Panel(message, style="footer", padding=(0, 1))
 
 
-def create_typing_indicator() -> Panel:
+def create_typing_indicator(estimated_tokens: int = 0, avg_tps: float = 0) -> Panel:
     """Create a typing indicator panel for when assistant is responding.
 
+    Args:
+        estimated_tokens: Estimated response tokens
+        avg_tps: Average tokens per second from history
+
     Returns:
-        Rich Panel showing typing indicator
+        Rich Panel showing typing indicator with optional time estimate
     """
+    from rich.text import Text
+
+    content = Text()
+    content.append("⏳ Generating response", style="dim italic")
+
+    # Add time estimate if we have enough data
+    if estimated_tokens > 0 and avg_tps > 10:
+        estimated_time = estimated_tokens / avg_tps
+        content.append(f" (~{estimated_time:.0f}s based on {estimated_tokens} tokens @ {avg_tps:.0f} tok/s)", style="dim yellow")
+    else:
+        content.append("...", style="dim italic")
+
     return Panel(
-        "[dim italic]...[/dim italic]",
+        content,
         title="[chat.assistant]ASSISTANT[/chat.assistant]",
         border_style="dim green",
         padding=(0, 1)

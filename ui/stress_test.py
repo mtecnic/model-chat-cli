@@ -426,7 +426,60 @@ class StressTestView:
 
         self.console.print(summary)
 
+        # Show response time trend chart
+        if len(self.current_results) > 1:
+            self.console.print()
+            self._show_trend_chart()
+
         # Show errors if any
         if self.current_stats.errors:
             self.console.print(f"\n[red]Encountered {len(self.current_stats.errors)} errors[/red]")
             self.console.print("[dim]Check logs/stress_test_*.log for details[/dim]")
+
+    def _show_trend_chart(self):
+        """Show ASCII trend charts for response times and TPS."""
+        from rich.text import Text
+
+        # Get successful results with timing data
+        successful = [r for r in self.current_results if r.status == "success" and r.duration > 0]
+
+        if not successful:
+            return
+
+        # Response time trend
+        self.console.print(Panel("[bold]Response Time Trend[/bold]", border_style="cyan"))
+
+        max_duration = max(r.duration for r in successful)
+        chart_width = 50
+
+        # Show last 20 results
+        display_results = successful[-20:] if len(successful) > 20 else successful
+
+        for i, result in enumerate(display_results):
+            bar_length = int((result.duration / max_duration) * chart_width)
+            bar = "█" * bar_length
+
+            line = Text()
+            line.append(f"#{result.request_id:3d} ", style="dim")
+            line.append(bar, style="cyan")
+            line.append(f" {result.duration:.1f}s", style="bold")
+
+            self.console.print(line)
+
+        # TPS trend
+        self.console.print()
+        self.console.print(Panel("[bold]Tokens/sec Trend[/bold]", border_style="yellow"))
+
+        max_tps = max(r.tokens_per_sec for r in successful if r.tokens_per_sec > 0)
+
+        for i, result in enumerate(display_results):
+            if result.tokens_per_sec > 0:
+                bar_length = int((result.tokens_per_sec / max_tps) * chart_width)
+                bar = "▓" * bar_length
+
+                line = Text()
+                line.append(f"#{result.request_id:3d} ", style="dim")
+                line.append(bar, style="yellow")
+                line.append(f" {result.tokens_per_sec:.0f} tok/s", style="bold")
+
+                self.console.print(line)

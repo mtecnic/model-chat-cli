@@ -146,6 +146,7 @@ async def check_server_health(server: Dict) -> Dict:
 
 # Cache file location
 CACHE_FILE = Path.home() / ".model_chat_cache.json"
+FAVORITES_FILE = Path.home() / ".model_chat_favorites.json"
 
 
 def save_cache(servers: List[Dict]) -> None:
@@ -166,6 +167,63 @@ def load_cache() -> Optional[List[Dict]]:
     except Exception:
         pass  # Silently fail if cache can't be loaded
     return None
+
+
+def save_favorite(server: Dict, model: str) -> None:
+    """Add a server/model combination to favorites."""
+    favorites = load_favorites()
+
+    # Create favorite entry
+    favorite = {
+        "server": server,
+        "model": model,
+        "added_at": int(asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else 0)
+    }
+
+    # Check if already in favorites
+    for fav in favorites:
+        if fav["server"]["url"] == server["url"] and fav["model"] == model:
+            return  # Already favorited
+
+    favorites.append(favorite)
+
+    try:
+        with open(FAVORITES_FILE, 'w') as f:
+            json.dump(favorites, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_favorites() -> List[Dict]:
+    """Load favorites from file."""
+    try:
+        if FAVORITES_FILE.exists():
+            with open(FAVORITES_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def remove_favorite(server_url: str, model: str) -> None:
+    """Remove a favorite."""
+    favorites = load_favorites()
+    favorites = [f for f in favorites if not (f["server"]["url"] == server_url and f["model"] == model)]
+
+    try:
+        with open(FAVORITES_FILE, 'w') as f:
+            json.dump(favorites, f, indent=2)
+    except Exception:
+        pass
+
+
+def is_favorite(server_url: str, model: str) -> bool:
+    """Check if a server/model is favorited."""
+    favorites = load_favorites()
+    for fav in favorites:
+        if fav["server"]["url"] == server_url and fav["model"] == model:
+            return True
+    return False
 
 
 async def quick_validate_cache(servers: List[Dict], progress_callback=None) -> List[Dict]:

@@ -5,7 +5,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.prompt import Prompt
 from rich.panel import Panel
 
-from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache
+from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache, load_favorites, save_favorite, is_favorite
 from ui.components import create_model_table
 
 
@@ -36,50 +36,93 @@ class DiscoveryView:
         )
         self.console.print()
 
-        # Try cache first - automatically use it
-        cached_servers = load_cache()
+        # Check for favorites first
+        favorites = load_favorites()
+        if favorites:
+            self.console.print(f"[success]Found {len(favorites)} favorite(s)[/success]")
+            self.console.print()
+            use_favorites = Prompt.ask(
+                "[prompt]Use favorites? (Y/n)[/prompt]",
+                choices=["y", "Y", "n", "N", ""],
+                default="y"
+            )
 
-        if cached_servers:
-            # Automatically validate and use cached servers
-            self.console.print("[info]Validating cached servers...[/info]")
-            validated_servers = await self._validate_cache(cached_servers)
-
-            if validated_servers:
-                self.servers = validated_servers
-                save_cache(validated_servers)
-                self._display_servers(validated_servers)
+            if use_favorites.lower() in ["y", ""]:
+                # Use favorites
+                self.servers = [fav["server"] for fav in favorites]
+                self._display_servers(self.servers)
             else:
-                # Cache validation failed, do full scan
+                # Proceed with normal discovery
+                self.console.print()
+                cached_servers = load_cache()
+                if cached_servers:
+                    self.console.print("[info]Validating cached servers...[/info]")
+                    validated_servers = await self._validate_cache(cached_servers)
+                    if validated_servers:
+                        self.servers = validated_servers
+                        save_cache(validated_servers)
+                        self._display_servers(validated_servers)
+                    else:
+                        self.servers = await self._scan_network()
+                        if self.servers:
+                            save_cache(self.servers)
+                            self._display_servers(self.servers)
+                else:
+                    self.servers = await self._scan_network()
+                    if self.servers:
+                        save_cache(self.servers)
+                        self._display_servers(self.servers)
+        else:
+            # No favorites, try cache first
+            cached_servers = load_cache()
+
+            if cached_servers:
+                # Automatically validate and use cached servers
+                self.console.print("[info]Validating cached servers...[/info]")
+                validated_servers = await self._validate_cache(cached_servers)
+
+                if validated_servers:
+                    self.servers = validated_servers
+                    save_cache(validated_servers)
+                    self._display_servers(validated_servers)
+                else:
+                    # Cache validation failed, do full scan
+                    self.servers = await self._scan_network()
+                    if self.servers:
+                        save_cache(self.servers)
+                        self._display_servers(self.servers)
+            else:
+                # No cache, do full network scan
                 self.servers = await self._scan_network()
                 if self.servers:
                     save_cache(self.servers)
                     self._display_servers(self.servers)
-        else:
-            # No cache, do full network scan
-            self.servers = await self._scan_network()
-            if self.servers:
-                save_cache(self.servers)
-                self._display_servers(self.servers)
 
         # No models found
         if not self.servers:
             self.console.print("[warning]No models found on local network[/warning]")
             return None, None
 
-        # Model selection loop (allows rescanning with 'R')
+        # Model selection loop (allows rescanning with 'R' and filtering with 'F')
+        filtered_servers = self.servers
+        filter_text = ""
+
         while True:
-            # Build model list
+            # Build model list from filtered servers
             self.models = []
-            for server in self.servers:
+            for server in filtered_servers:
                 for model in server.get("models", []):
                     self.models.append((server, model))
 
             # Prompt for selection
             self.console.print()
-            valid_choices = [str(i) for i in range(1, len(self.models) + 1)] + ['r', 'R']
+            if filter_text:
+                self.console.print(f"[dim]Filter active: '{filter_text}' ({len(self.models)} models)[/dim]")
+
+            valid_choices = [str(i) for i in range(1, len(self.models) + 1)] + ['r', 'R', 'f', 'F', 'c', 'C']
             choice = Prompt.ask(
-                "[prompt]Select a model (number) or [cyan]R[/cyan] to rescan[/prompt]",
-                choices=valid_choices
+                "[prompt]Select model or [cyan]R[/cyan]:rescan [cyan]F[/cyan]:filter [cyan]C[/cyan]:clear filter[/prompt]",
+                choices=valid_choices + ['']  # Allow empty for just showing menu
             )
 
             # Handle rescan
@@ -88,15 +131,45 @@ class DiscoveryView:
                 self.servers = await self._scan_network()
                 if self.servers:
                     save_cache(self.servers)
+                    filtered_servers = self.servers
+                    filter_text = ""
                     self._display_servers(self.servers)
                 else:
                     self.console.print("[warning]No models found on local network[/warning]")
                     return None, None
                 continue
 
+            # Handle filter
+            if choice.upper() == 'F':
+                filter_text = Prompt.ask("[prompt]Filter by (model name/IP/type)[/prompt]")
+                filtered_servers = self._filter_servers(self.servers, filter_text)
+                self._display_servers(filtered_servers)
+                continue
+
+            # Handle clear filter
+            if choice.upper() == 'C':
+                filter_text = ""
+                filtered_servers = self.servers
+                self._display_servers(self.servers)
+                continue
+
             # Return selected model
-            server, model = self.models[int(choice) - 1]
-            return server, model
+            if choice and choice.isdigit():
+                server, model = self.models[int(choice) - 1]
+
+                # Ask if they want to favorite this model
+                if not is_favorite(server["url"], model):
+                    self.console.print()
+                    add_fav = Prompt.ask(
+                        "[prompt]Add this model to favorites? (y/N)[/prompt]",
+                        choices=["y", "Y", "n", "N", ""],
+                        default="n"
+                    )
+                    if add_fav.lower() == 'y':
+                        save_favorite(server, model)
+                        self.console.print("[success]Added to favorites![/success]")
+
+                return server, model
 
     async def _scan_network(self) -> list:
         """Perform full network scan with progress display.
@@ -168,3 +241,43 @@ class DiscoveryView:
         self.console.print(table)
         self.console.print()
         self.console.print("[dim]Press Ctrl+C to quit[/dim]", justify="center")
+
+    def _filter_servers(self, servers: list, filter_text: str) -> list:
+        """Filter servers by model name, IP, or type.
+
+        Args:
+            servers: List of server dictionaries
+            filter_text: Filter string
+
+        Returns:
+            Filtered list of servers
+        """
+        if not filter_text:
+            return servers
+
+        filter_lower = filter_text.lower()
+        filtered = []
+
+        for server in servers:
+            # Check if filter matches IP
+            if filter_lower in server['ip'].lower():
+                filtered.append(server)
+                continue
+
+            # Check if filter matches type
+            if filter_lower in server['type'].lower():
+                filtered.append(server)
+                continue
+
+            # Check if filter matches status
+            if filter_lower in server.get('status', '').lower():
+                filtered.append(server)
+                continue
+
+            # Check if any model name matches
+            for model in server.get('models', []):
+                if filter_lower in model.lower():
+                    filtered.append(server)
+                    break
+
+        return filtered
