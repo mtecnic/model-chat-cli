@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
+from utils.validation import InputValidator, ValidationError
 
 
 class ConversationManager:
@@ -41,7 +42,23 @@ class ConversationManager:
 
         Returns:
             Conversation ID (filename without extension)
+
+        Raises:
+            ValidationError: If validation fails
         """
+        # Validate inputs
+        if not history:
+            raise ValidationError("Cannot save empty conversation")
+
+        if len(history) > 10000:
+            raise ValidationError("Conversation too long (max 10000 messages)")
+
+        if name:
+            name = InputValidator.validate_conversation_name(name)
+
+        # Check disk space (require at least 1MB free)
+        InputValidator.check_disk_space(self.conversations_dir, required_bytes=1024 * 1024)
+
         timestamp = datetime.now()
 
         # Generate conversation ID
@@ -77,8 +94,11 @@ class ConversationManager:
             filepath = self.conversations_dir / f"{conv_id}_{counter}.json"
             counter += 1
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(conversation, f, indent=2, ensure_ascii=False)
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(conversation, f, indent=2, ensure_ascii=False)
+        except (IOError, OSError) as e:
+            raise ValidationError(f"Failed to save conversation: {e}")
 
         return filepath.stem
 
@@ -96,10 +116,20 @@ class ConversationManager:
         if not filepath.exists():
             return None
 
+        # Check file size (max 50MB for safety)
+        try:
+            InputValidator.validate_file_size(filepath, max_size=50 * 1024 * 1024)
+        except ValidationError as e:
+            import logging
+            logging.warning(f"Skipping large conversation file: {e}")
+            return None
+
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, IOError) as e:
+            import logging
+            logging.warning(f"Failed to load conversation {conv_id}: {e}")
             return None
 
     def list_conversations(
