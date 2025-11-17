@@ -79,16 +79,62 @@ export MODEL_CHAT_COMMON_PORTS="11434,1234,8000"
 python main.py
 ```
 
+## Testing
+
+Run the automated test suite:
+
+```bash
+# Install test dependencies
+pip install -r requirements.txt
+
+# Run all tests
+pytest
+
+# Run with coverage report
+pytest --cov=. --cov-report=html
+
+# Run specific test file
+pytest tests/test_validation.py -v
+```
+
+**Test Coverage**: 60%+ (116 tests across 7 test modules)
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for comprehensive security documentation.
+
+**Security Features**:
+- Input validation and sanitization
+- Path traversal protection
+- File size and disk space limits
+- Rate limiting and timeouts
+- Memory bounds (max 1000 messages)
+- Dependency scanning (0 vulnerabilities)
+
 ## Architecture
 
 ```
 model-chat-cli/
-├── main.py          # Application entry point
-├── scanner.py       # Network scanning logic
-├── client.py        # Model API client
+├── main.py              # Application entry point
+├── scanner.py           # Network scanning logic
+├── client.py            # Model API client
+├── config.py            # Configuration management
+├── stress_tester.py     # Load testing engine
 ├── ui/
-│   ├── screens.py   # Textual screens
-│   ├── widgets.py   # Custom widgets
-│   └── theme.tcss   # Modern CSS theme
-└── requirements.txt
+│   ├── discovery.py     # Model discovery interface
+│   ├── chat.py          # Chat interface
+│   ├── stress_test.py   # Stress test UI
+│   ├── components.py    # Reusable UI components
+│   ├── effects.py       # Visual effects
+│   └── theme.py         # Theme system
+├── utils/
+│   ├── token_estimator.py      # Token counting
+│   ├── context_manager.py      # Context window tracking
+│   ├── conversation_manager.py # Save/load conversations
+│   ├── retry.py                # Exponential backoff
+│   └── validation.py           # Input validation
+├── tests/              # Test suite (116 tests)
+├── requirements.txt    # Python dependencies
+├── pytest.ini         # Test configuration
+└── SECURITY.md        # Security documentation
 ```
