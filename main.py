@@ -10,6 +10,8 @@ from ui.theme import APP_THEME
 from ui.discovery import DiscoveryView
 from ui.chat import ChatView
 from ui.stress_test import StressTestView
+from ui.arena import ArenaView
+from ui.multi_arena import MultiArenaView
 
 
 class AppState(Enum):
@@ -17,6 +19,8 @@ class AppState(Enum):
     DISCOVERY = "discovery"
     CHAT = "chat"
     STRESS_TEST = "stress_test"
+    PROMPT_ARENA = "prompt_arena"
+    ARENA = "arena"
     QUIT = "quit"
 
 
@@ -40,11 +44,15 @@ class ModelChatCLI:
                     await self._chat_mode()
                 elif self.state == AppState.STRESS_TEST:
                     await self._stress_test_mode()
+                elif self.state == AppState.PROMPT_ARENA:
+                    await self._prompt_arena_mode()
+                elif self.state == AppState.ARENA:
+                    await self._arena_mode()
 
         except KeyboardInterrupt:
-            self.console.print("\n[info]Goodbye![/info]")
+            self.console.print("\n[chrome]Goodbye![/chrome]")
         except Exception as e:
-            self.console.print(f"\n[error]An error occurred: {e}[/error]")
+            self.console.print(f"\n[status.error]An error occurred: {e}[/status.error]")
             raise
 
     async def _discovery_mode(self):
@@ -59,7 +67,6 @@ class ModelChatCLI:
                 self.selected_model = model
                 self.state = AppState.CHAT
             else:
-                # No models found or user cancelled
                 self.state = AppState.QUIT
 
         except KeyboardInterrupt:
@@ -73,17 +80,17 @@ class ModelChatCLI:
             result = await chat.run()
 
             if result == "switch":
-                # User wants to switch models
                 self.state = AppState.DISCOVERY
             elif result == "stress_test":
-                # User wants to run stress tests
                 self.state = AppState.STRESS_TEST
+            elif result == "prompt_arena":
+                self.state = AppState.PROMPT_ARENA
+            elif result == "arena":
+                self.state = AppState.ARENA
             else:
-                # User quit
                 self.state = AppState.QUIT
 
         except KeyboardInterrupt:
-            # Return to discovery on Ctrl+C
             self.state = AppState.DISCOVERY
 
     async def _stress_test_mode(self):
@@ -94,14 +101,41 @@ class ModelChatCLI:
             result = await stress_test.run()
 
             if result == "back":
-                # Return to chat
                 self.state = AppState.CHAT
             else:
-                # User quit
                 self.state = AppState.QUIT
 
         except KeyboardInterrupt:
-            # Return to chat on Ctrl+C
+            self.state = AppState.CHAT
+
+    async def _prompt_arena_mode(self):
+        """Handle prompt arena mode - compare system prompts."""
+        arena = ArenaView(self.console, self.selected_server, self.selected_model)
+
+        try:
+            result = await arena.run()
+
+            if result == "back":
+                self.state = AppState.CHAT
+            else:
+                self.state = AppState.QUIT
+
+        except KeyboardInterrupt:
+            self.state = AppState.CHAT
+
+    async def _arena_mode(self):
+        """Handle multi-server arena mode - compare models side by side."""
+        arena = MultiArenaView(self.console, self.selected_server, self.selected_model)
+
+        try:
+            result = await arena.run()
+
+            if result == "back":
+                self.state = AppState.CHAT
+            else:
+                self.state = AppState.QUIT
+
+        except KeyboardInterrupt:
             self.state = AppState.CHAT
 
 

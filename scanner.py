@@ -66,6 +66,20 @@ async def probe_server(ip: str, port: int, client: httpx.AsyncClient, semaphore:
                 "models": [m.get("name", "unknown") for m in ollama_data.get("models", [])],
             }
 
+        # Fallback: detect Ollama servers with no models pulled via /api/version
+        if openai_data is None and ollama_data is None:
+            version_data = await check_endpoint(client, base_url, "/api/version")
+            if version_data:
+                return {
+                    "ip": ip,
+                    "port": port,
+                    "url": base_url,
+                    "type": "ollama",
+                    "models": [],
+                    "ollama_version": version_data.get("version", "unknown"),
+                    "note": "Ollama running, no models pulled",
+                }
+
         return None
 
 

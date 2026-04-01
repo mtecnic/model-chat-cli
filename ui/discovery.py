@@ -3,7 +3,6 @@ import asyncio
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Prompt
-from rich.panel import Panel
 
 from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache
 from ui.components import create_model_table
@@ -13,35 +12,21 @@ class DiscoveryView:
     """Handle model discovery and selection."""
 
     def __init__(self, console: Console):
-        """Initialize discovery view.
-
-        Args:
-            console: Rich Console instance
-        """
         self.console = console
         self.servers = []
         self.models = []  # List of (server, model_name) tuples
 
     async def run(self) -> tuple:
-        """Run the discovery process and return selected model.
-
-        Returns:
-            Tuple of (server_dict, model_name)
-        """
-        # Show title
+        """Run the discovery process and return selected model."""
         self.console.print()
-        self.console.print(
-            Panel("[bold cyan]Model Discovery[/bold cyan]", style="title"),
-            justify="center"
-        )
+        self.console.rule("[accent.bold]Model Discovery[/accent.bold]", style="chrome.border")
         self.console.print()
 
-        # Try cache first - automatically use it
+        # Try cache first
         cached_servers = load_cache()
 
         if cached_servers:
-            # Automatically validate and use cached servers
-            self.console.print("[info]Validating cached servers...[/info]")
+            self.console.print("  [status.info]Validating cached servers...[/status.info]")
             validated_servers = await self._validate_cache(cached_servers)
 
             if validated_servers:
@@ -49,40 +34,34 @@ class DiscoveryView:
                 save_cache(validated_servers)
                 self._display_servers(validated_servers)
             else:
-                # Cache validation failed, do full scan
                 self.servers = await self._scan_network()
                 if self.servers:
                     save_cache(self.servers)
                     self._display_servers(self.servers)
         else:
-            # No cache, do full network scan
             self.servers = await self._scan_network()
             if self.servers:
                 save_cache(self.servers)
                 self._display_servers(self.servers)
 
-        # No models found
         if not self.servers:
-            self.console.print("[warning]No models found on local network[/warning]")
+            self.console.print("  [status.warn]No models found on local network.[/status.warn]")
             return None, None
 
-        # Model selection loop (allows rescanning with 'R')
+        # Model selection loop
         while True:
-            # Build model list
             self.models = []
             for server in self.servers:
                 for model in server.get("models", []):
                     self.models.append((server, model))
 
-            # Prompt for selection
             self.console.print()
             valid_choices = [str(i) for i in range(1, len(self.models) + 1)] + ['r', 'R']
             choice = Prompt.ask(
-                "[prompt]Select a model (number) or [cyan]R[/cyan] to rescan[/prompt]",
+                "[prompt]Select model (number) or [accent]R[/accent] to rescan[/prompt]",
                 choices=valid_choices
             )
 
-            # Handle rescan
             if choice.upper() == 'R':
                 self.console.print()
                 self.servers = await self._scan_network()
@@ -90,21 +69,16 @@ class DiscoveryView:
                     save_cache(self.servers)
                     self._display_servers(self.servers)
                 else:
-                    self.console.print("[warning]No models found on local network[/warning]")
+                    self.console.print("  [status.warn]No models found on local network.[/status.warn]")
                     return None, None
                 continue
 
-            # Return selected model
             server, model = self.models[int(choice) - 1]
             return server, model
 
     async def _scan_network(self) -> list:
-        """Perform full network scan with progress display.
-
-        Returns:
-            List of discovered servers
-        """
-        self.console.print("[info]Scanning local network...[/info]\n")
+        """Perform full network scan with progress display."""
+        self.console.print("  [status.info]Scanning local network...[/status.info]\n")
 
         servers = []
         with Progress(
@@ -127,14 +101,7 @@ class DiscoveryView:
         return servers
 
     async def _validate_cache(self, cached_servers: list) -> list:
-        """Validate cached servers with progress.
-
-        Args:
-            cached_servers: Servers from cache
-
-        Returns:
-            Validated servers or empty list if validation fails
-        """
+        """Validate cached servers with progress."""
         validated_servers = []
         with Progress(
             SpinnerColumn(),
@@ -156,15 +123,11 @@ class DiscoveryView:
         return validated_servers
 
     def _display_servers(self, servers: list):
-        """Display discovered servers as a table.
-
-        Args:
-            servers: List of server dictionaries
-        """
+        """Display discovered servers as a table."""
         if not servers:
             return
 
         table = create_model_table(servers)
         self.console.print(table)
         self.console.print()
-        self.console.print("[dim]Press Ctrl+C to quit[/dim]", justify="center")
+        self.console.print("[chrome]Ctrl+C to quit[/chrome]", justify="center")
