@@ -7,6 +7,7 @@ from datetime import datetime
 
 from client import ModelClient
 from logger import setup_logger, log_request_error, log_vllm_error
+from ui.components import estimate_tokens
 
 
 @dataclass
@@ -113,30 +114,6 @@ class StressTester:
 
         return prompt
 
-    def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (rough heuristic).
-
-        Args:
-            text: Text to estimate
-
-        Returns:
-            Estimated token count
-        """
-        if not text:
-            return 0
-
-        words = text.split()
-        word_count = len(words)
-        special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
-        newline_count = text.count('\n')
-
-        token_estimate = (
-            word_count * 1.3 +
-            special_chars * 0.5 +
-            newline_count * 1.0
-        )
-
-        return max(1, int(token_estimate))
 
     async def _run_single_request(
         self,
@@ -182,7 +159,7 @@ class StressTester:
 
             result.response = response
             result.end_time = time.time()
-            result.token_count = self._estimate_tokens(response)
+            result.token_count = estimate_tokens(response)
 
             if result.duration > 0 and result.token_count > 0:
                 result.tokens_per_sec = result.token_count / result.duration

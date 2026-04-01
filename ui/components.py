@@ -1,10 +1,6 @@
 """Reusable Rich components for the Model Chat CLI."""
-from rich.panel import Panel
 from rich.table import Table
-from rich.markdown import Markdown
-from rich.syntax import Syntax
-from rich.console import Group
-import re
+from rich.text import Text
 
 
 def create_model_table(servers: list) -> Table:
@@ -16,11 +12,11 @@ def create_model_table(servers: list) -> Table:
     Returns:
         Rich Table with all discovered models
     """
-    table = Table(title="[bold cyan]Discovered Models[/bold cyan]", show_header=True)
-    table.add_column("#", style="dim", width=4, justify="right")
+    table = Table(title="[accent.bold]Discovered Models[/accent.bold]", show_header=True)
+    table.add_column("#", style="chrome", width=4, justify="right")
     table.add_column("Model", style="model.name", no_wrap=True)
     table.add_column("Server", style="model.server")
-    table.add_column("Type", style="dim", justify="center")
+    table.add_column("Type", style="chrome", justify="center")
     table.add_column("Status", justify="center", width=8)
     table.add_column("Latency", justify="right", width=10)
 
@@ -29,10 +25,10 @@ def create_model_table(servers: list) -> Table:
         for model in server.get("models", []):
             status = server.get("status", "unknown")
             status_symbol = {
-                "healthy": "[model.healthy]✓[/model.healthy]",
-                "error": "[model.error]✗[/model.error]",
-                "unknown": "[model.unknown]•[/model.unknown]",
-            }.get(status, "•")
+                "healthy": "[status.ok]\u2713[/status.ok]",
+                "error": "[status.error]\u2717[/status.error]",
+                "unknown": "[status.warn]\u2022[/status.warn]",
+            }.get(status, "\u2022")
 
             response_time = server.get("response_time", 0)
             latency = f"{response_time}ms" if response_time else "N/A"
@@ -53,116 +49,120 @@ def create_model_table(servers: list) -> Table:
     return table
 
 
-def create_chat_message(role: str, content: str, highlight_code: bool = True) -> Panel:
-    """Create a Rich Panel for a chat message with optional code highlighting.
+def format_stats_line(tokens: int, elapsed: float, tps: float) -> Text:
+    """Render compact stats after a response: ↳ 234 tok · 5.2s · 45.0 t/s"""
+    t = Text()
+    t.append("  \u21b3 ", style="chrome")
+    t.append(str(tokens), style="metric")
+    t.append(" tok ", style="metric.label")
+    t.append("\u00b7 ", style="chrome")
+    t.append(f"{elapsed:.1f}s", style="metric")
+    t.append(" \u00b7 ", style="chrome")
+    t.append(f"{tps:.1f}", style="metric")
+    t.append(" t/s", style="metric.label")
+    return t
 
-    Args:
-        role: Message role ("user" or "assistant")
-        content: Message content
-        highlight_code: Whether to highlight code blocks
 
-    Returns:
-        Rich Panel formatted as a chat message
+def format_menu_item(number: str, label: str, description: str = "") -> str:
+    """Render a numbered menu choice consistently."""
+    line = f"  [accent]{number}.[/accent] {label}"
+    if description:
+        line += f"\n     [chrome.muted]{description}[/chrome.muted]"
+    return line
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count in a single pass, unicode-aware.
+
+    Handles CJK (each char ~ 1 token), emoji grapheme clusters (~ 2-3 tokens
+    per visible emoji regardless of codepoint count), Latin words (~ 1.3 tokens),
+    and skips zero-width / format characters.
     """
-    style = "chat.user" if role == "user" else "chat.assistant"
-    border = "blue" if role == "user" else "green"
+    import unicodedata
 
-    # For assistant messages, render as markdown with code highlighting
-    if role == "assistant" and highlight_code:
-        renderable = render_markdown_with_code(content)
-    else:
-        renderable = content
+    if not text:
+        return 0
 
-    return Panel(
-        renderable,
-        title=f"[{style}]{role.upper()}[/{style}]",
-        border_style=border,
-        padding=(0, 1)
-    )
+    tokens = 0.0
+    newlines = 0
+    in_latin_word = False
+    in_emoji_seq = False  # tracks ZWJ / modifier sequences as one unit
 
+    def _flush_latin():
+        nonlocal tokens, in_latin_word
+        if in_latin_word:
+            tokens += 1.3
+            in_latin_word = False
 
-def render_markdown_with_code(content: str):
-    """Render markdown content with syntax-highlighted code blocks.
+    def _is_emoji_component(c, cp):
+        """Check if codepoint is part of an emoji sequence."""
+        cat = unicodedata.category(c)
+        # Symbol-Other (most emoji), Modifier-Symbol, skin tone modifiers,
+        # regional indicators, variation selectors, keycap combining
+        if cat in ('So', 'Sk'):
+            return True
+        if 0x1F3FB <= cp <= 0x1F3FF:  # skin tone modifiers
+            return True
+        if 0x1F1E0 <= cp <= 0x1F1FF:  # regional indicator symbols (flags)
+            return True
+        if cp in (0xFE0E, 0xFE0F):  # variation selectors
+            return True
+        if 0xE0020 <= cp <= 0xE007F:  # tag characters (flag subdivision)
+            return True
+        if 0x20E3 == cp:  # combining enclosing keycap
+            return True
+        return False
 
-    Args:
-        content: Markdown content potentially containing code blocks
+    for c in text:
+        cp = ord(c)
 
-    Returns:
-        Rich renderable (Markdown or Group with Syntax)
-    """
-    # Check if there are code blocks
-    code_block_pattern = r'```(\w+)?\n(.*?)```'
-    matches = list(re.finditer(code_block_pattern, content, re.DOTALL))
+        # Zero-width joiners / format chars — extend current emoji sequence
+        if cp in (0x200D, 0x200B, 0x200C, 0xFEFF, 0x00AD) or unicodedata.category(c) == 'Cf':
+            # ZWJ keeps the emoji sequence alive; others are just skipped
+            continue
 
-    if not matches:
-        # No code blocks, just render as markdown
-        return Markdown(content)
+        if _is_emoji_component(c, cp):
+            _flush_latin()
+            if not in_emoji_seq:
+                in_emoji_seq = True
+                # Will be counted when sequence ends
+            continue
 
-    # Split content into parts and render code blocks with syntax highlighting
-    renderables = []
-    last_end = 0
+        # Non-emoji char: close any open emoji sequence
+        if in_emoji_seq:
+            tokens += 2.5  # one visible emoji cluster ~ 2-3 BPE tokens
+            in_emoji_seq = False
 
-    for match in matches:
-        # Add markdown before code block
-        if match.start() > last_end:
-            pre_content = content[last_end:match.start()].strip()
-            if pre_content:
-                renderables.append(Markdown(pre_content))
+        if c == '\n':
+            newlines += 1
+            _flush_latin()
 
-        # Add syntax-highlighted code block
-        language = match.group(1) or "text"
-        code = match.group(2).strip()
-        renderables.append(Syntax(code, language, theme="monokai", line_numbers=False))
+        elif c.isspace():
+            _flush_latin()
 
-        last_end = match.end()
+        elif '\u4E00' <= c <= '\u9FFF' or '\u3400' <= c <= '\u4DBF' or \
+             '\uF900' <= c <= '\uFAFF' or '\U00020000' <= c <= '\U0002A6DF':
+            _flush_latin()
+            tokens += 1
 
-    # Add remaining content after last code block
-    if last_end < len(content):
-        post_content = content[last_end:].strip()
-        if post_content:
-            renderables.append(Markdown(post_content))
+        elif '\u3040' <= c <= '\u30FF' or '\u31F0' <= c <= '\u31FF':
+            _flush_latin()
+            tokens += 1
 
-    return Group(*renderables) if len(renderables) > 1 else renderables[0]
+        elif '\uAC00' <= c <= '\uD7AF':
+            _flush_latin()
+            tokens += 1
 
+        elif c.isalnum():
+            in_latin_word = True
 
-def create_header(model: str, server: str, avg_tps: float = 0.0) -> Panel:
-    """Create a header panel showing current model and server.
+        else:
+            _flush_latin()
+            tokens += 0.5
 
-    Args:
-        model: Model name
-        server: Server address
-        avg_tps: Average tokens per second (optional)
+    # Flush trailing state
+    _flush_latin()
+    if in_emoji_seq:
+        tokens += 2.5
 
-    Returns:
-        Rich Panel formatted as header
-    """
-    content = f"[bold cyan]{model}[/bold cyan] @ [dim]{server}[/dim]"
-    if avg_tps > 0:
-        content += f"  |  [bold yellow]{avg_tps:.1f}[/bold yellow] [dim]tokens/sec[/dim]"
-    return Panel(content, style="header", padding=(0, 1))
-
-
-def create_footer(message: str) -> Panel:
-    """Create a footer panel with help text or status.
-
-    Args:
-        message: Footer message
-
-    Returns:
-        Rich Panel formatted as footer
-    """
-    return Panel(message, style="footer", padding=(0, 1))
-
-
-def create_typing_indicator() -> Panel:
-    """Create a typing indicator panel for when assistant is responding.
-
-    Returns:
-        Rich Panel showing typing indicator
-    """
-    return Panel(
-        "[dim italic]...[/dim italic]",
-        title="[chat.assistant]ASSISTANT[/chat.assistant]",
-        border_style="dim green",
-        padding=(0, 1)
-    )
+    return max(1, int(tokens + newlines))

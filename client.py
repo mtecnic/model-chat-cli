@@ -14,29 +14,36 @@ class ModelClient:
         self.server_type = server["type"]
 
     async def chat_stream(
-        self, message: str, history: Optional[list] = None
+        self, message: str, history: Optional[list] = None,
+        enable_thinking: Optional[bool] = None
     ) -> AsyncGenerator[str, None]:
         """Send a chat message and stream the response."""
         if self.server_type == "openai":
-            async for chunk in self._chat_stream_openai(message, history):
+            async for chunk in self._chat_stream_openai(message, history, enable_thinking):
                 yield chunk
         else:  # ollama
-            async for chunk in self._chat_stream_ollama(message, history):
+            async for chunk in self._chat_stream_ollama(message, history, enable_thinking):
                 yield chunk
 
     async def _chat_stream_openai(
-        self, message: str, history: Optional[list] = None
+        self, message: str, history: Optional[list] = None,
+        enable_thinking: Optional[bool] = None
     ) -> AsyncGenerator[str, None]:
         """Stream chat using OpenAI-compatible API."""
         # Create a copy of history to avoid mutating the original
         messages = (history or []).copy()
-        messages.append({"role": "user", "content": message})
+        if message:
+            messages.append({"role": "user", "content": message})
 
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": True,
         }
+
+        # Pass thinking toggle for models that support it (e.g. Qwen 3/3.5 on vLLM)
+        if enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream(
@@ -69,18 +76,25 @@ class ModelClient:
                                 continue
 
     async def _chat_stream_ollama(
-        self, message: str, history: Optional[list] = None
+        self, message: str, history: Optional[list] = None,
+        enable_thinking: Optional[bool] = None
     ) -> AsyncGenerator[str, None]:
         """Stream chat using Ollama API."""
         # Create a copy of history to avoid mutating the original
         messages = (history or []).copy()
-        messages.append({"role": "user", "content": message})
+        if message:
+            messages.append({"role": "user", "content": message})
 
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": True,
         }
+
+        # Pass thinking toggle for Ollama models that support it
+        if enable_thinking is not None:
+            payload["options"] = payload.get("options", {})
+            payload["options"]["enable_thinking"] = enable_thinking
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream(
@@ -103,23 +117,6 @@ class ModelClient:
                                 chunk = json.loads(line)
                                 content = chunk.get("message", {}).get("content", "")
                                 if content:
-                                    # Fix double-encoded JSON responses
-                                    # Some models return JSON-stringified content that needs additional parsing
-                                    if isinstance(content, str) and content.strip().startswith(('{', '[')):
-                                        try:
-                                            decoded_content = json.loads(content)
-                                            # If parsed result is a dict, try to extract text field
-                                            if isinstance(decoded_content, dict):
-                                                content = decoded_content.get("text", decoded_content.get("content", str(decoded_content)))
-                                            elif isinstance(decoded_content, list):
-                                                # If it's a list, join elements or stringify
-                                                content = " ".join(str(item) for item in decoded_content) if decoded_content else str(decoded_content)
-                                            else:
-                                                # For other types (str, int, etc.), use as-is
-                                                content = str(decoded_content)
-                                        except (json.JSONDecodeError, ValueError):
-                                            # Not valid JSON or parsing failed, use original content
-                                            pass
                                     yield content
                             except json.JSONDecodeError:
                                 continue
