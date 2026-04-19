@@ -4,6 +4,7 @@ import json
 import random
 import time
 import datetime
+from think_parser import split_thinking, strip_thinking
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from rich.console import Console
@@ -626,6 +627,7 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
 
         try:
             result = await judge_client.chat(judge_prompt, messages)
+            result = strip_thinking(result)
             start = result.find("{")
             end = result.rfind("}") + 1
             if start >= 0 and end > start:
@@ -659,10 +661,13 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
         # Display labels (blind or real)
         display_labels = [self._get_display_label(i) for i in range(n)]
 
-        # Stream producers
+        # Stream producers — keep client refs so we can read last_metrics after
+        clients: List[Optional[ModelClient]] = [None] * n
+
         async def stream_one(idx: int):
             server, model = self.models[idx]
             client = ModelClient(server, model)
+            clients[idx] = client
             messages = []
             if self.system_prompt:
                 messages.append({"role": "system", "content": self.system_prompt})
@@ -701,19 +706,35 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Build response objects
+        # Build response objects — prefer real token counts from API
         responses = []
         for i in range(n):
-            text = "".join(buffers[i])
+            raw_text = "".join(buffers[i])
+            parsed = split_thinking(raw_text)
             elapsed = end_times[i] - start_times[i] if end_times[i] > 0 else 0
-            tokens = estimate_tokens(text)
-            tps = tokens / elapsed if elapsed > 0 and tokens > 0 else 0
+
+            # Use API-reported token count if available, else estimate
+            api_metrics = clients[i].last_metrics if clients[i] else None
+            if api_metrics and api_metrics.completion_tokens > 0:
+                tokens = api_metrics.completion_tokens
+            else:
+                tokens = estimate_tokens(parsed.content)
+
+            # Compute decode TPS: prefer Ollama native timing, else derive from TTFT
+            if api_metrics and api_metrics.eval_duration_ns > 0 and tokens > 0:
+                tps = tokens / (api_metrics.eval_duration_ns / 1e9)
+            elif ttfts[i] > 0 and elapsed > ttfts[i] and tokens > 0:
+                tps = tokens / (elapsed - ttfts[i])
+            elif elapsed > 0 and tokens > 0:
+                tps = tokens / elapsed
+            else:
+                tps = 0
 
             responses.append(ArenaResponse(
                 model_key=self.model_keys[i],
                 server=self.models[i][0],
                 model=self.models[i][1],
-                text=text,
+                text=parsed.content,
                 ttft=ttfts[i],
                 total_time=elapsed,
                 token_count=tokens,
@@ -763,7 +784,9 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
         max_lines = cell_height - 3
 
         for i in range(n):
-            text = "".join(buffers[i])
+            raw = "".join(buffers[i])
+            # Cheap tag removal for display — avoids regex on full buffer every refresh
+            text = raw.replace("<think>", "").replace("</think>", "")
             lines = text.split('\n')
 
             if errors[i]:

@@ -33,4 +33,7 @@ APP_THEME = Theme({
     # Model display
     "model.name": "bold cyan",
     "model.server": "dim",
+
+    # Thinking mode
+    "thinking": "dim italic",
 })
