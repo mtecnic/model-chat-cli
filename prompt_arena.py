@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from think_parser import split_thinking, strip_thinking
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 
@@ -346,9 +347,10 @@ class PromptArena:
             # Use non-streaming chat for cleaner collection
             response = await self.client.chat(question, messages)
 
-            result.response = response
+            parsed = split_thinking(response)
+            result.response = parsed.content
             result.end_time = time.time()
-            result.token_count = estimate_tokens(response)
+            result.token_count = estimate_tokens(parsed.content)
             result.status = "success"
 
             self.logger.info(
@@ -411,6 +413,7 @@ class PromptArena:
 
         try:
             result = await self.client.chat(judge_prompt, messages)
+            result = strip_thinking(result)
             return self._parse_judge_result(result, response_a, response_b)
         except Exception as e:
             self.logger.error(f"Judge error: {e}")

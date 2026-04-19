@@ -8,7 +8,9 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import HTML
 
 from client import ModelClient
+from storage.history import ChatHistoryManager
 from ui.components import format_stats_line, estimate_tokens
+from think_parser import parsed_chat_stream, ChunkType
 
 
 class ChatView:
@@ -96,10 +98,12 @@ class ChatView:
         import time
         import sys
 
-        full_response = ""
+        thinking_text = ""
+        content_text = ""
         start_time = time.time()
         token_count = 0
         interrupted = False
+        was_thinking = False
 
         messages_with_system = self._build_message_history()
 
@@ -112,22 +116,48 @@ class ChatView:
             # Stream chunks directly to stdout — Rich.Live freezes on long output
             # due to lock contention between its refresh thread and the async loop
             try:
-                async for chunk in self.client.chat_stream(
-                    None, messages_with_system,
-                    enable_thinking=self.thinking_enabled,
-                ):
-                    full_response += chunk
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
+                stream = parsed_chat_stream(
+                    self.client.chat_stream(
+                        None, messages_with_system,
+                        enable_thinking=self.thinking_enabled,
+                    ),
+                    start_thinking=self.thinking_enabled,
+                )
+                async for chunk in stream:
+                    if chunk.chunk_type == ChunkType.THINKING:
+                        if not was_thinking:
+                            # Entering thinking — start dim italic
+                            sys.stdout.write("\033[2;3m")
+                            was_thinking = True
+                        thinking_text += chunk.text
+                        sys.stdout.write(chunk.text)
+                        sys.stdout.flush()
+                    else:
+                        if was_thinking:
+                            # Leaving thinking — reset style, add separator
+                            sys.stdout.write("\033[0m\n\n")
+                            was_thinking = False
+                        content_text += chunk.text
+                        sys.stdout.write(chunk.text)
+                        sys.stdout.flush()
             except (asyncio.CancelledError, KeyboardInterrupt):
                 interrupted = True
-                full_response += "\n\n(interrupted)"
+                content_text += "\n\n(interrupted)"
 
+            # Reset any lingering ANSI style
+            if was_thinking:
+                sys.stdout.write("\033[0m")
             sys.stdout.write('\n')
             sys.stdout.flush()
 
-            # Estimate tokens once after streaming
-            token_count = estimate_tokens(full_response)
+            # If thinking was enabled but model didn't actually think
+            # (no </think> seen, all text classified as thinking), treat as content
+            if thinking_text and not content_text:
+                content_text = thinking_text
+                thinking_text = ""
+
+            # Estimate tokens once after streaming (content only for stats)
+            token_count = estimate_tokens(content_text)
 
             # Calculate tokens per second
             elapsed_time = time.time() - start_time
@@ -140,11 +170,18 @@ class ChatView:
                 self.avg_tps = sum(self.tps_samples) / len(self.tps_samples)
 
             # Print stats line
-            if full_response:
+            if content_text or thinking_text:
                 if current_tps > 0 and not interrupted:
-                    self.console.print(format_stats_line(token_count, elapsed_time, current_tps))
+                    stats = format_stats_line(token_count, elapsed_time, current_tps)
+                    if thinking_text:
+                        think_tokens = estimate_tokens(thinking_text)
+                        stats.append(f"  ({think_tokens} thinking)", style="chrome.muted")
+                    self.console.print(stats)
                 self.console.print()
-                self.history.append({"role": "assistant", "content": full_response})
+                entry = {"role": "assistant", "content": content_text}
+                if thinking_text:
+                    entry["thinking"] = thinking_text
+                self.history.append(entry)
 
             if interrupted:
                 raise KeyboardInterrupt()
@@ -346,7 +383,22 @@ class ChatView:
                 for msg in self.history:
                     role = msg["role"].upper()
                     content = msg["content"]
-                    f.write(f"## {role}\n\n{content}\n\n")
+                    if role == "ASSISTANT" and msg.get("thinking"):
+                        f.write(f"## {role}\n\n")
+                        f.write(f"<details>\n<summary>Thinking</summary>\n\n{msg['thinking']}\n\n</details>\n\n")
+                        f.write(f"{content}\n\n")
+                    else:
+                        f.write(f"## {role}\n\n{content}\n\n")
+
+            try:
+                ChatHistoryManager().save_conversation(
+                    model=self.model,
+                    server=f"{self.server['ip']}:{self.server['port']}",
+                    messages=self.history,
+                )
+            except Exception as e:
+                self.console.print(f"  [status.warn]History persist failed: {e}[/status.warn]")
+
             return filename
         except Exception as e:
             self.console.print(f"  [status.error]Failed to export: {e}[/status.error]")
