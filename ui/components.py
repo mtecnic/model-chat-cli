@@ -49,17 +49,36 @@ def create_model_table(servers: list) -> Table:
     return table
 
 
-def format_stats_line(tokens: int, elapsed: float, tps: float) -> Text:
-    """Render compact stats after a response: ↳ 234 tok · 5.2s · 45.0 t/s"""
+def format_stats_line(
+    tokens: int,
+    elapsed: float,
+    tps: float,
+    ttft: float | None = None,
+    think_tokens: int | None = None,
+) -> Text:
+    """Render compact stats after a response:
+    ↳ 234 tok · 42 think · 5.2s · 45.0 t/s · 320ms ttft
+    """
     t = Text()
     t.append("  \u21b3 ", style="chrome")
     t.append(str(tokens), style="metric")
-    t.append(" tok ", style="metric.label")
-    t.append("\u00b7 ", style="chrome")
+    t.append(" tok", style="metric.label")
+    if think_tokens is not None:
+        t.append(" \u00b7 ", style="chrome")
+        t.append(str(think_tokens), style="metric")
+        t.append(" think", style="metric.label")
+    t.append(" \u00b7 ", style="chrome")
     t.append(f"{elapsed:.1f}s", style="metric")
     t.append(" \u00b7 ", style="chrome")
     t.append(f"{tps:.1f}", style="metric")
     t.append(" t/s", style="metric.label")
+    if ttft is not None and ttft > 0:
+        t.append(" \u00b7 ", style="chrome")
+        if ttft < 1:
+            t.append(f"{ttft * 1000:.0f}ms", style="metric")
+        else:
+            t.append(f"{ttft:.2f}s", style="metric")
+        t.append(" ttft", style="metric.label")
     return t
 
 

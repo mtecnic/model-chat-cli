@@ -100,7 +100,9 @@ class ChatView:
 
         thinking_text = ""
         content_text = ""
-        start_time = time.time()
+        request_start = time.time()
+        first_token_time = None
+        end_time = None
         token_count = 0
         interrupted = False
         was_thinking = False
@@ -124,10 +126,12 @@ class ChatView:
                     start_thinking=self.thinking_enabled,
                 )
                 async for chunk in stream:
+                    if first_token_time is None:
+                        first_token_time = time.time()
                     if chunk.chunk_type == ChunkType.THINKING:
                         if not was_thinking:
-                            # Entering thinking — start dim italic
-                            sys.stdout.write("\033[2;3m")
+                            # Entering thinking — italic only (content stays normal)
+                            sys.stdout.write("\033[3m")
                             was_thinking = True
                         thinking_text += chunk.text
                         sys.stdout.write(chunk.text)
@@ -140,7 +144,9 @@ class ChatView:
                         content_text += chunk.text
                         sys.stdout.write(chunk.text)
                         sys.stdout.flush()
+                end_time = time.time()
             except (asyncio.CancelledError, KeyboardInterrupt):
+                end_time = time.time()
                 interrupted = True
                 content_text += "\n\n(interrupted)"
 
@@ -158,12 +164,19 @@ class ChatView:
 
             # Estimate tokens once after streaming (content only for stats)
             token_count = estimate_tokens(content_text)
+            think_token_count = estimate_tokens(thinking_text) if thinking_text else 0
 
-            # Calculate tokens per second
-            elapsed_time = time.time() - start_time
+            # Decode tok/s: generated tokens / time from first token → last token.
+            # Excludes TTFT (queue + prompt eval + network RTT) so the number
+            # reflects actual model decode speed, matching stress_tester's decode_tps.
+            if end_time is None:
+                end_time = time.time()
+            ttft = first_token_time - request_start if first_token_time else 0.0
+            decode_elapsed = (end_time - first_token_time) if first_token_time else 0.0
+            total_generated = token_count + think_token_count
             current_tps = 0
-            if elapsed_time > 0 and token_count > 0:
-                current_tps = token_count / elapsed_time
+            if decode_elapsed > 0 and total_generated > 0:
+                current_tps = total_generated / decode_elapsed
                 self.tps_samples.append(current_tps)
                 if len(self.tps_samples) > 10:
                     self.tps_samples.pop(0)
@@ -172,10 +185,13 @@ class ChatView:
             # Print stats line
             if content_text or thinking_text:
                 if current_tps > 0 and not interrupted:
-                    stats = format_stats_line(token_count, elapsed_time, current_tps)
-                    if thinking_text:
-                        think_tokens = estimate_tokens(thinking_text)
-                        stats.append(f"  ({think_tokens} thinking)", style="chrome.muted")
+                    stats = format_stats_line(
+                        token_count,
+                        decode_elapsed,
+                        current_tps,
+                        ttft=ttft,
+                        think_tokens=think_token_count if self.thinking_enabled else None,
+                    )
                     self.console.print(stats)
                 self.console.print()
                 entry = {"role": "assistant", "content": content_text}

@@ -19,6 +19,12 @@ storage/
 *.cache
 .model_chat_cache.json
 
+# Local exports (chat / arena / stress results)
+arena_*.md
+chat_*.md
+chat__*.md
+stress_results_*.json
+
 # IDE
 .vscode/
 .idea/
