@@ -1,6 +1,7 @@
 """Stress testing engine for local AI servers."""
 import asyncio
 import json
+import math
 import random
 import time
 from dataclasses import asdict, dataclass, field
@@ -33,6 +34,24 @@ class TestResult:
     completion_tokens: int = 0
     ttft: float = 0.0
     decode_tps: float = 0.0
+    # Realistic-user mode: 0 for other modes
+    session_id: int = 0
+    turn_number: int = 0
+    # Tool-bench mode: empty/zero for other modes
+    task_id: str = ""
+    task_difficulty: str = ""
+    task_passed: bool = False
+    agent_iterations: int = 0
+    tool_calls_made: int = 0
+    called_expected: bool = False
+    called_forbidden: bool = False
+    answer_check_ok: bool = False
+    within_call_bounds: bool = False
+    exceeded_budget: bool = False
+    failure_reason: str = ""
+    malformed_calls: int = 0
+    unknown_tool_calls: int = 0
+    empty_responses: int = 0
 
     @property
     def duration(self) -> float:
@@ -93,6 +112,12 @@ class TestStats:
     second_half_ttft: float = 0.0
     # Free-text header for the run (set by consistency test prompt).
     notes: str = ""
+    # Tool-bench aggregates (zero for other modes)
+    tasks_passed: int = 0
+    tasks_total: int = 0
+    pass_rate: float = 0.0
+    avg_agent_iterations: float = 0.0
+    avg_tool_calls_per_task: float = 0.0
 
     def add_error(self, error_msg: str):
         """Add error to log with timestamp."""
@@ -301,7 +326,11 @@ class StressTester:
         self,
         request_id: int,
         prompt: str,
-        update_callback: Callable = None
+        update_callback: Callable = None,
+        max_tokens: Optional[int] = None,
+        history: Optional[List[dict]] = None,
+        session_id: int = 0,
+        turn_number: int = 0,
     ) -> TestResult:
         """Run a single test request with real API metrics.
 
@@ -309,6 +338,10 @@ class StressTester:
             request_id: Unique request identifier
             prompt: Prompt to send
             update_callback: Optional callback for progress updates
+            max_tokens: Per-request output cap. Falls back to self.max_tokens.
+            history: Prior [{"role","content"},...] turns (realistic-user mode).
+            session_id: Session grouping identifier (realistic-user mode).
+            turn_number: 1-indexed turn within the session (realistic-user mode).
 
         Returns:
             TestResult object
@@ -317,7 +350,9 @@ class StressTester:
             request_id=request_id,
             status="running",
             prompt=prompt,
-            start_time=time.monotonic()
+            start_time=time.monotonic(),
+            session_id=session_id,
+            turn_number=turn_number,
         )
 
         # Notify callback of start
@@ -330,13 +365,16 @@ class StressTester:
         try:
             self.logger.debug(f"Request #{request_id} starting: {prompt[:50]}...")
 
-            # Build message history with optional system prompt
+            # Build message history with optional system prompt + prior turns
             messages = []
             if self.system_prompt:
                 messages.append({"role": "system", "content": self.system_prompt})
+            if history:
+                messages.extend(history)
 
             response, metrics = await self._model_client.chat_with_metrics(
-                prompt, messages, max_tokens=self.max_tokens,
+                prompt, messages,
+                max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
                 http_client=self._http_client,
             )
 
@@ -763,4 +801,309 @@ class StressTester:
                          f"peak concurrency: {max_concurrent}")
 
         self._finalize("sustained_load")
+        return self.stats
+
+    async def run_realistic_user_test(
+        self,
+        duration_minutes: int,
+        mean_rpm: float = 30.0,
+        max_tokens_cap: int = 500,
+        prompt_mix: tuple = (0.6, 0.3, 0.1),
+        output_mix: tuple = (
+            (50, 0.4), (150, 0.35), (300, 0.15), (500, 0.10),
+        ),
+        mean_session_turns: float = 1.0,
+        think_time_mean_s: float = 4.0,
+        update_callback: Callable = None,
+    ) -> TestStats:
+        """Emulate realistic traffic: Poisson arrivals spawn multi-turn sessions.
+
+        Outer layer: users arrive independently (exponential inter-arrival gaps
+        at ``mean_rpm``). Inner layer: each arrival becomes a session that runs
+        K sequential turns with growing conversation history and log-normal
+        think time between turns.
+
+        With ``mean_session_turns == 1.0`` this collapses to pure population
+        mode (one-shot requests).
+
+        Args:
+            duration_minutes: How long to accept new sessions for.
+            mean_rpm: Mean new sessions per minute.
+            max_tokens_cap: Hard ceiling on per-turn output tokens.
+            prompt_mix: (short, medium, long) weights for prompt size bucket.
+            output_mix: ((tokens, weight), ...) distribution for output size.
+            mean_session_turns: Expected turns per session (1.0 => one-shot).
+            think_time_mean_s: Median think time between turns (log-normal).
+            update_callback: Called with each TestResult on start/completion.
+        """
+        mean_interval = 60.0 / mean_rpm
+        max_in_flight = max(20, int(mean_rpm * 2))
+        estimated_turns = max(1, int(duration_minutes * mean_rpm * max(1.0, mean_session_turns)))
+        MAX_TURNS = 20
+
+        SIZE_BUCKETS = {"short": 80, "medium": 800, "long": 4000}
+        size_names = list(SIZE_BUCKETS.keys())
+
+        self.logger.info(
+            f"Starting realistic user test: {duration_minutes}min, "
+            f"~{mean_rpm} sessions/min, avg ~{mean_session_turns:.1f} turns, "
+            f"cap={max_tokens_cap}"
+        )
+
+        self.results = []
+        self.stats = TestStats(total=estimated_turns)
+
+        async def _run_session(session_id: int, request_id_start: int) -> tuple:
+            """Run K sequential turns for one session.
+
+            Returns (next_free_request_id, [TestResult, ...]).
+            """
+            if mean_session_turns <= 1:
+                K = 1
+            else:
+                K = 1 + int(random.expovariate(1.0 / max(1e-6, mean_session_turns - 1)))
+            K = min(K, MAX_TURNS)
+
+            history: List[dict] = []
+            turns: List[TestResult] = []
+            rid = request_id_start
+
+            for turn in range(1, K + 1):
+                bucket = random.choices(size_names, weights=prompt_mix)[0]
+                prompt = self._get_prompt(rid, length=SIZE_BUCKETS[bucket])
+
+                out_tokens, out_weights = zip(*output_mix)
+                req_max_tokens = min(
+                    max_tokens_cap,
+                    random.choices(out_tokens, weights=out_weights)[0],
+                )
+
+                result = await self._run_single_request(
+                    rid, prompt, update_callback,
+                    max_tokens=req_max_tokens,
+                    history=list(history),
+                    session_id=session_id,
+                    turn_number=turn,
+                )
+                turns.append(result)
+                rid += 1
+
+                if result.status != "success":
+                    break
+                history.append({"role": "user", "content": prompt})
+                history.append({"role": "assistant", "content": result.response or ""})
+
+                if turn < K:
+                    try:
+                        think_s = random.lognormvariate(math.log(think_time_mean_s), 0.8)
+                    except ValueError:
+                        think_s = think_time_mean_s
+                    await asyncio.sleep(think_s)
+
+            return rid, turns
+
+        session_tasks: List = []
+        in_flight: set = set()
+        session_id = 0
+        next_request_id = 1
+        max_concurrent_sessions = 0
+        stall_warned = False
+
+        async with httpx.AsyncClient(timeout=300.0) as http_client:
+            self._http_client = http_client
+            await self._warmup()
+
+            wall_start = time.monotonic()
+            end_time = wall_start + duration_minutes * 60
+
+            while time.monotonic() < end_time:
+                if len(in_flight) >= max_in_flight:
+                    if not stall_warned:
+                        self.logger.warning(
+                            f"In-flight session cap reached ({max_in_flight}) — "
+                            f"server may be stalling. Pausing new sessions until drain."
+                        )
+                        stall_warned = True
+                    await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+
+                session_id += 1
+                rid_start = next_request_id
+                next_request_id += MAX_TURNS
+
+                task = asyncio.create_task(_run_session(session_id, rid_start))
+                session_tasks.append(task)
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
+                if len(in_flight) > max_concurrent_sessions:
+                    max_concurrent_sessions = len(in_flight)
+
+                gap = random.expovariate(1.0 / mean_interval)
+                remaining = end_time - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(gap, remaining))
+
+            session_results = await asyncio.gather(*session_tasks, return_exceptions=True)
+            wall_clock = time.monotonic() - wall_start
+
+        self._http_client = None
+
+        for r in session_results:
+            if isinstance(r, tuple) and len(r) == 2:
+                _next_rid, turns = r
+                self.results.extend(turns)
+
+        self.stats.total = len(self.results)
+        self._compute_stats(self.results, wall_clock)
+        self.stats.max_concurrent = max_concurrent_sessions
+
+        self.logger.info(
+            f"Realistic user test complete: {self.stats.success}/{self.stats.total} turns "
+            f"across {session_id} sessions, peak concurrent sessions: {max_concurrent_sessions}"
+        )
+
+        self._finalize("realistic_user")
+        return self.stats
+
+    async def run_tool_bench_test(
+        self,
+        subset: str = "full",
+        concurrency: int = 1,
+        max_tokens_per_step: int = 512,
+        update_callback: Callable = None,
+    ) -> TestStats:
+        """Run the agentic tool-calling benchmark.
+
+        Each task runs an agent loop: model emits tool calls, harness executes
+        mock tools, results fed back, until model returns a final answer or the
+        per-task iteration budget is exhausted. Tasks are scored on tool
+        selection, forbidden-tool avoidance, answer content, and call bounds.
+
+        Args:
+            subset: "quick" (7 easy tasks) or "full" (15 tasks).
+            concurrency: number of agent loops to run in parallel.
+            max_tokens_per_step: per-step output cap.
+            update_callback: receives a TestResult on start/completion of each task.
+        """
+        from tool_bench import (get_tasks, run_agent_loop, score_task,
+                                 get_tools_and_executors_for_subset)
+
+        tasks_list = get_tasks(subset)
+        n = len(tasks_list)
+        active_tools, active_executors = get_tools_and_executors_for_subset(subset)
+
+        self.logger.info(
+            f"Starting tool-bench: {n} tasks, concurrency={concurrency}, "
+            f"max_tokens_per_step={max_tokens_per_step}, subset={subset}"
+        )
+
+        self.results = []
+        self.stats = TestStats(total=n)
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _run_one(idx: int, task) -> TestResult:
+            result = TestResult(
+                request_id=idx + 1,
+                status="running",
+                prompt=task.prompt,
+                start_time=time.monotonic(),
+                task_id=task.task_id,
+                task_difficulty=task.difficulty,
+            )
+            if update_callback:
+                try:
+                    await update_callback(result)
+                except Exception as e:
+                    self.logger.error(f"Callback error on start: {e}")
+
+            async with sem:
+                try:
+                    traj = await run_agent_loop(
+                        self._model_client, task,
+                        max_tokens=max_tokens_per_step,
+                        http_client=self._http_client,
+                        tools=active_tools,
+                        executors=active_executors,
+                    )
+                    score = score_task(task, traj)
+                    result.end_time = time.monotonic()
+                    result.response = traj.final_answer or ""
+                    result.token_count = sum(
+                        estimate_tokens(tc.result) for tc in traj.tool_calls
+                    ) + estimate_tokens(result.response)
+                    result.agent_iterations = traj.iterations
+                    result.tool_calls_made = score.tool_calls
+                    result.task_passed = score.passed
+                    result.called_expected = score.tool_use_pass
+                    result.called_forbidden = not score.no_forbidden
+                    result.answer_check_ok = score.answer_pass
+                    result.within_call_bounds = score.within_call_bounds
+                    result.exceeded_budget = traj.exceeded_budget
+                    result.failure_reason = score.failure_reason
+                    result.malformed_calls = traj.malformed_count
+                    result.unknown_tool_calls = traj.unknown_tool_count
+                    result.empty_responses = traj.empty_responses
+                    if traj.error:
+                        result.status = "error"
+                        result.error_msg = traj.error
+                        self.stats.failed += 1
+                        self.stats.add_error(f"Task {task.task_id}: {traj.error}")
+                    else:
+                        result.status = "success"
+                        self.stats.success += 1
+                    if score.passed:
+                        self.stats.tasks_passed += 1
+                except Exception as e:
+                    import traceback
+                    result.status = "error"
+                    result.end_time = time.monotonic()
+                    result.error_msg = f"{type(e).__name__}: {e}"
+                    self.stats.failed += 1
+                    self.stats.add_error(f"Task {task.task_id}: {result.error_msg}")
+                    self.logger.error(f"Task {task.task_id} crashed: {e}")
+                    self.logger.debug(traceback.format_exc())
+                finally:
+                    self.stats.completed += 1
+                    if update_callback:
+                        try:
+                            await update_callback(result)
+                        except Exception as e:
+                            self.logger.error(f"Callback error on completion: {e}")
+            return result
+
+        async with httpx.AsyncClient(timeout=300.0) as http_client:
+            self._http_client = http_client
+            wall_start = time.monotonic()
+            coros = [_run_one(i, t) for i, t in enumerate(tasks_list)]
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            wall_clock = time.monotonic() - wall_start
+
+        self._http_client = None
+        for r in results:
+            if isinstance(r, TestResult):
+                self.results.append(r)
+
+        # Aggregate-only computation (skip the standard tps/ttft path — these
+        # tasks are agent loops, not single-shot generations, so per-request
+        # tps doesn't carry the usual meaning).
+        successful = [r for r in self.results if r.status == "success"]
+        if successful:
+            self.stats.avg_response_time = sum(r.duration for r in successful) / len(successful)
+            self.stats.avg_agent_iterations = (
+                sum(r.agent_iterations for r in successful) / len(successful)
+            )
+            self.stats.avg_tool_calls_per_task = (
+                sum(r.tool_calls_made for r in successful) / len(successful)
+            )
+        self.stats.tasks_total = n
+        self.stats.pass_rate = self.stats.tasks_passed / n if n else 0.0
+        self.stats.wall_clock_time = wall_clock
+
+        self.logger.info(
+            f"Tool-bench complete: {self.stats.tasks_passed}/{n} passed "
+            f"({self.stats.pass_rate * 100:.1f}%), "
+            f"avg iterations: {self.stats.avg_agent_iterations:.1f}"
+        )
+
+        self._finalize("tool_bench")
         return self.stats

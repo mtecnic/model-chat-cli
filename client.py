@@ -393,6 +393,190 @@ class ModelClient:
         # No usage data available — metrics.completion_tokens stays 0, caller falls back
         return full_response, metrics
 
+    # ----------------------------------------------------------------- #
+    # Tool calling (non-streaming) — supports agentic loops
+    # ----------------------------------------------------------------- #
+    def make_assistant_tool_msg(self, content: str, tool_calls: list) -> dict:
+        """Build an assistant message containing tool_calls in server-native format.
+
+        ``tool_calls`` is the normalized list returned by ``chat_with_tools``:
+        ``[{"id": str, "name": str, "arguments": dict}, ...]``.
+        """
+        if self.server_type == "openai":
+            return {
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.get("id") or f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc.get("arguments") or {}),
+                        },
+                    }
+                    for i, tc in enumerate(tool_calls)
+                ],
+            }
+        # Ollama
+        return {
+            "role": "assistant",
+            "content": content or "",
+            "tool_calls": [
+                {"function": {"name": tc["name"], "arguments": tc.get("arguments") or {}}}
+                for tc in tool_calls
+            ],
+        }
+
+    def make_tool_result_msg(self, tool_call_id: str, result: str) -> dict:
+        """Build a tool-result message in server-native format."""
+        if self.server_type == "openai":
+            return {
+                "role": "tool",
+                "tool_call_id": tool_call_id or "call_0",
+                "content": str(result),
+            }
+        return {"role": "tool", "content": str(result)}
+
+    async def chat_with_tools(
+        self,
+        messages: list,
+        tools: list,
+        max_tokens: Optional[int] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
+    ) -> Tuple[str, list, ChatMetrics]:
+        """Non-streaming chat with tool support.
+
+        Returns ``(content, tool_calls, metrics)``. ``tool_calls`` is normalized to
+        ``[{"id": str, "name": str, "arguments": dict}, ...]`` regardless of server.
+        ``content`` may be empty when the assistant only emits tool calls.
+        """
+        if self.server_type == "openai":
+            return await self._chat_tools_openai(messages, tools, max_tokens, http_client)
+        return await self._chat_tools_ollama(messages, tools, max_tokens, http_client)
+
+    async def _chat_tools_openai(
+        self, messages: list, tools: list,
+        max_tokens: Optional[int], http_client: Optional[httpx.AsyncClient],
+    ) -> Tuple[str, list, ChatMetrics]:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+
+        request_start = time.monotonic()
+        async with _http_session(http_client) as client:
+            r = await client.post(
+                f"{self.url}/v1/chat/completions",
+                json=payload, timeout=300.0,
+            )
+            r.raise_for_status()
+            body = r.json()
+
+        metrics = ChatMetrics()
+        metrics.ttft = time.monotonic() - request_start  # non-streaming → TTFT == full
+        usage = body.get("usage") or {}
+        metrics.prompt_tokens = usage.get("prompt_tokens", 0)
+        metrics.completion_tokens = usage.get("completion_tokens", 0)
+
+        msg = (body.get("choices") or [{}])[0].get("message") or {}
+        content = msg.get("content") or ""
+        raw_calls = msg.get("tool_calls") or []
+        normalized = []
+        for i, tc in enumerate(raw_calls):
+            fn = tc.get("function") or {}
+            args_raw = fn.get("arguments")
+            malformed = False
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw)
+                    if not isinstance(args, dict):
+                        malformed = True
+                        args = {}
+                except Exception:
+                    malformed = True
+                    args = {}
+            elif isinstance(args_raw, dict):
+                args = args_raw
+            elif args_raw is None:
+                args = {}
+            else:
+                malformed = True
+                args = {}
+            normalized.append({
+                "id": tc.get("id") or f"call_{i}",
+                "name": fn.get("name") or "",
+                "arguments": args,
+                "malformed_args": malformed,
+            })
+        return content, normalized, metrics
+
+    async def _chat_tools_ollama(
+        self, messages: list, tools: list,
+        max_tokens: Optional[int], http_client: Optional[httpx.AsyncClient],
+    ) -> Tuple[str, list, ChatMetrics]:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["options"] = {"num_predict": max_tokens}
+
+        request_start = time.monotonic()
+        async with _http_session(http_client) as client:
+            r = await client.post(
+                f"{self.url}/api/chat",
+                json=payload, timeout=300.0,
+            )
+            r.raise_for_status()
+            body = r.json()
+
+        metrics = ChatMetrics()
+        metrics.ttft = time.monotonic() - request_start
+        metrics.completion_tokens = body.get("eval_count", 0)
+        metrics.prompt_tokens = body.get("prompt_eval_count", 0)
+        metrics.eval_duration_ns = body.get("eval_duration", 0)
+        metrics.prompt_eval_duration_ns = body.get("prompt_eval_duration", 0)
+
+        msg = body.get("message") or {}
+        content = msg.get("content") or ""
+        raw_calls = msg.get("tool_calls") or []
+        normalized = []
+        for i, tc in enumerate(raw_calls):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            malformed = False
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                    if not isinstance(args, dict):
+                        malformed = True
+                        args = {}
+                except Exception:
+                    malformed = True
+                    args = {}
+            elif isinstance(args, dict):
+                pass
+            elif args is None:
+                args = {}
+            else:
+                malformed = True
+                args = {}
+            normalized.append({
+                "id": tc.get("id") or f"call_{i}",
+                "name": fn.get("name") or "",
+                "arguments": args,
+                "malformed_args": malformed,
+            })
+        return content, normalized, metrics
+
     async def _chat_metrics_ollama(
         self, message: str, history: Optional[list] = None,
         max_tokens: Optional[int] = None,

@@ -11,9 +11,12 @@ A terminal tool for discovering, chatting with, and benchmarking local AI models
 - Health checks with latency measurements
 
 ### Chat
-- Streaming responses with tokens-per-second tracking
+- Streaming responses with **decode tokens-per-second** (timer starts on first token, so TTFT and queue time are excluded — true generation rate, not wall-clock)
+- **TTFT (time-to-first-token)** displayed alongside throughput
+- Thinking-token count shown when `/think` is enabled (e.g. `↳ 234 tok · 42 think · 5.2s · 45.0 t/s · 320ms ttft`)
+- Italic styling for thinking content; normal styling for the actual response
 - System prompt support (set, edit, clear)
-- Thinking/reasoning mode toggle (for models like Qwen 3/3.5)
+- Thinking/reasoning mode toggle (for models like Qwen 3 / 3.5)
 - Conversation export to markdown
 - Natural terminal scrolling (no screen clearing)
 
@@ -44,12 +47,43 @@ Compare different system prompts on the same model to find the best one for a gi
 
 ### Stress Testing (`/stress`)
 
-Three load testing modes:
+Six modes covering throughput, stability, realistic traffic patterns, and agentic tool-calling capability:
+
 - **Throughput** -- Concurrent requests (5-50 simultaneous)
 - **Token Stress** -- Increasing prompt lengths (500-10,000 tokens)
 - **Sustained Load** -- Endurance testing over time (1 min to 24 hrs)
+- **Consistency** -- Same prompt N times serially to isolate hardware-level noise (thermals, DVFS, drivers, kernel scheduling). Reports stddev + drift between first and second halves of the run.
+- **Realistic User** -- Poisson-distributed session arrivals with multi-turn conversations. Each arrival becomes a session that runs K turns sequentially with growing context (history replay) and log-normal think time between turns. Three depth profiles: One-shot (pure population), Short (~3 turns), Long (~8 turns). Tests how the model behaves under believable aggregate load *and* deep individual sessions.
+- **Tool Calling Benchmark** -- Agentic tool-calling tests with mock tools, full agent loop (model → tool calls → execution → tool results → repeat until final answer). See below.
 
-Live dashboard with per-request status, error log, and summary statistics.
+Live dashboard with per-request status, error log, percentile latencies, variance, drift, and summary statistics.
+
+#### Tool Calling Benchmark
+
+Drives the model through a suite of agentic tasks requiring one or more tool calls. The harness implements a real agent loop (parallel tool-call support, conversation history, normalized OpenAI / Ollama tool format), executes mock tools deterministically, and feeds results back until the model produces a final answer or exhausts its iteration budget.
+
+Six difficulty tiers:
+
+| Tier | Tasks | What it tests |
+|------|-------|---------------|
+| **Quick**     | 7  | Smoke test -- single-tool baseline |
+| **Full**      | 45 | Everything across all tiers |
+| **Hard**      | 10 | Distractors, error recovery, multi-step planning, sequential dependencies, refusal calibration |
+| **Brutal**    | 6  | Long-horizon orchestration, prompt-injection resistance, parallel-required arrival, arg-precision (dict-subset matching), unstated dependency chains |
+| **Realistic** | 6  | Verbose JSON envelopes (extract values from noise), pagination (multi-page iteration with cursor tracking), transient failures with retry, strict ISO-639 args, 33-tool catalog with 15 noise distractors |
+| **EXTREME**   | 8  | Multi-hop prompt injection (chained files), conflicting tool outputs (model must flag the disagreement), self-verification (compute twice via different decompositions), social-engineered exfiltration refusal, compositional dependency chains, arg-type precision (int vs string), refusal calibration on prompts that look tool-needing but aren't |
+
+Mock tools include `calculator`, `get_weather`, `get_stock_price`, `read_file`, `list_files`, `db_query`, `translate`, `unit_convert`, `get_current_time`, `send_email`, plus distractor tools (`eval_math`, `weather_lookup`, `currency_convert`, etc.) that return errors hinting at the right tool. Realistic tier adds verbose JSON envelopes, pagination, `flaky_search` (rate-limited), `weather_secondary` (independent provider for cross-checks), and 15 deprecated/duplicate noise tools.
+
+**Multidimensional scoring** -- each task is scored on:
+- **Answer correctness**: numeric tolerance (commas/scientific normalized), word-boundary regex with synonym tuples
+- **Tool use**: per-call argument validation with dict-subset matching (`filters: {country: "JP"}` constraint allows extra filter keys but requires the country filter)
+- **Forbidden tools**: explicit per-task list, plus `expect_zero_tools` flag that auto-forbids all tools
+- **Iteration / call budget**: `min_tool_calls` / `max_tool_calls` / `max_iterations`
+
+**Tool name normalization** handles common namespace prefixes (`functions.calculator`, `default_api.db_query`, `tools::send_email`) so newer models don't fail on cosmetic format differences.
+
+**Diagnostics** surface root cause for each failed task in a `Reason` column: missing required call, called forbidden tool, answer missing number/word, budget exceeded, malformed args, unknown tool name, empty response. A separate "Model Diagnostics" panel aggregates malformed-JSON / unknown-tool / empty-response counts so capability gaps can be distinguished from chat-template / serving issues.
 
 ## Supported Servers
 
@@ -106,7 +140,8 @@ model-chat-cli/
 ├── scanner.py           # Network discovery, caching, health checks
 ├── client.py            # Model API client (OpenAI + Ollama streaming)
 ├── prompt_arena.py      # System prompt comparison engine
-├── stress_tester.py     # Load testing engine
+├── stress_tester.py     # Load testing engine (throughput / sustained / consistency / realistic-user / tool-bench)
+├── tool_bench.py        # Agentic tool-calling benchmark (mock tools, agent loop, scoring, 6 tiers)
 ├── logger.py            # Centralized logging
 ├── storage/
 │   └── history.py       # Chat history persistence
