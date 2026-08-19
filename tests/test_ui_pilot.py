@@ -181,9 +181,8 @@ async def _test_theme_palette():
         theme = app.get_theme(app.theme)
         assert theme is not None
         gen = theme.to_color_system().generate()
-        assert hex_of(gen["background"]).lower() == "#0b1220", hex_of(gen["background"])
-        assert hex_of(gen["surface"]).lower() == "#121b2a", hex_of(gen["surface"])
-        assert hex_of(gen["text-muted"]).lower() == "#8b9ab0", hex_of(gen["text-muted"])
+        assert hex_of(gen["background"]).lower() == "#121212", hex_of(gen["background"])
+        assert hex_of(gen["surface"]).lower() == "#1a1a1a", hex_of(gen["surface"])
 
 
 def test_settings():

@@ -18,7 +18,6 @@ class PublishScreen(BaseScreen):
     PublishScreen #pub-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     PublishScreen #pub-status {
         height: 2;
@@ -31,8 +30,6 @@ class PublishScreen(BaseScreen):
     PublishScreen #pub-log-wrap { height: 3fr; }
     PublishScreen #pub-log {
         height: 100%;
-        border: round $panel;
-        border-title-color: $primary;
     }
     PublishScreen #pub-actions {
         height: 2;
@@ -65,7 +62,6 @@ class PublishScreen(BaseScreen):
         yield Static("", id="pub-hints")
 
     def on_mount(self) -> None:
-        self.query_one("#pub-log", RichLog).border_title = "log"
         self.query_one("#pub-header", Static).update(
             make_header("Publish", self.app.config.exports_root))
         self.query_one("#pub-hints", Static).update(

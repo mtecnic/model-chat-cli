@@ -3,19 +3,18 @@ from textual.theme import Theme
 
 
 def modelchat_theme() -> Theme:
-    """Deep-navy custom theme: layered surfaces and solid muted text."""
+    """Flat dark theme with classic cyan/blue/green/yellow accents."""
     return Theme(
         name="modelchat",
-        primary="#22d3ee",
-        secondary="#818cf8",
-        accent="#38bdf8",
-        success="#34d399",
-        error="#f87171",
-        warning="#fbbf24",
+        primary="#00a8cc",
+        secondary="#4a9eff",
+        accent="#00a8cc",
+        success="#2fae6b",
+        error="#e5484d",
+        warning="#d9a441",
         dark=True,
-        foreground="#dce3ec",
-        background="#0b1220",
-        surface="#121b2a",
-        panel="#1a2637",
-        variables={"text-muted": "#8b9ab0"},
+        foreground="#d0d0d0",
+        background="#121212",
+        surface="#1a1a1a",
+        panel="#242424",
     )

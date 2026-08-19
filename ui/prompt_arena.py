@@ -77,13 +77,10 @@ class PromptArenaScreen(BaseScreen):
     PromptArenaScreen #pa-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     PromptArenaScreen #pa-modes {
         height: auto;
         max-height: 8;
-        border: round $panel;
-        border-title-color: $primary;
     }
     PromptArenaScreen #pa-category {
         width: 26;
@@ -93,8 +90,6 @@ class PromptArenaScreen(BaseScreen):
     PromptArenaScreen #pa-prompts {
         height: auto;
         max-height: 10;
-        border: round $panel;
-        border-title-color: $primary;
     }
     PromptArenaScreen #pa-prompt-actions { height: 2; }
     PromptArenaScreen #pa-prompt-actions Button { width: 16; margin: 0 1; }
@@ -102,14 +97,10 @@ class PromptArenaScreen(BaseScreen):
     PromptArenaScreen #pa-live { height: 1fr; width: 100%; }
     PromptArenaScreen #pa-table {
         width: 55%;
-        border: round $panel;
-        border-title-color: $primary;
     }
     PromptArenaScreen #pa-log {
         width: 45%;
         height: 1fr;
-        border: round $panel;
-        border-title-color: $primary;
     }
     PromptArenaScreen #pa-summary { display: none; height: 1fr; }
     PromptArenaScreen #pa-scroll { height: 1fr; padding: 0 1; }
@@ -168,10 +159,6 @@ class PromptArenaScreen(BaseScreen):
         table.cursor_type = None
         for c in ("prompt", "status", "time(s)", "tok"):
             table.add_column(c)
-        self.query_one("#pa-modes", OptionList).border_title = "mode"
-        self.query_one("#pa-prompts", OptionList).border_title = "prompts"
-        self.query_one("#pa-table", DataTable).border_title = "leaderboard"
-        self.query_one("#pa-log", RichLog).border_title = "matchups"
         self._arena = PromptArena(self.app.server, self.app.model)
         self._populate_prompts()
 

@@ -56,13 +56,10 @@ class StressScreen(BaseScreen):
     StressScreen #stress-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     StressScreen OptionList {
         height: auto;
         max-height: 10;
-        border: round $panel;
-        border-title-color: $primary;
     }
     StressScreen #stress-config {
         height: auto;
@@ -85,8 +82,6 @@ class StressScreen(BaseScreen):
     }
     StressScreen #stress-table {
         width: 60%;
-        border: round $panel;
-        border-title-color: $primary;
     }
     StressScreen #stress-side {
         width: 40%;
@@ -95,14 +90,10 @@ class StressScreen(BaseScreen):
     }
     StressScreen #stress-stats {
         height: auto;
-        border: round $panel;
-        border-title-color: $primary;
         padding: 0 1;
     }
     StressScreen #stress-errors {
         height: 1fr;
-        border: round $panel;
-        border-title-color: $primary;
     }
     StressScreen #stress-summary {
         display: none;
@@ -162,10 +153,6 @@ class StressScreen(BaseScreen):
             self.query_one("#stress-modes", OptionList).add_option(
                 Option(Text.assemble((f"  {title}", "bold"), (f"  -  {desc}", MUTED)), id=key))
         self._table_setup()
-        self.query_one("#stress-modes", OptionList).border_title = "mode"
-        self.query_one("#stress-table", DataTable).border_title = "requests"
-        self.query_one("#stress-stats", Static).border_title = "stats"
-        self.query_one("#stress-errors", RichLog).border_title = "errors"
         self.query_one("#stress-modes", OptionList).highlighted = 0
         self._mode = "throughput"
         self._rebuild_config()

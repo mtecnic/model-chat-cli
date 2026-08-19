@@ -26,7 +26,6 @@ class StatusBar(Static):
         height: 1;
         background: $surface;
         color: $text-muted;
-        border-top: solid $panel;
         text-style: bold;
     }
     """

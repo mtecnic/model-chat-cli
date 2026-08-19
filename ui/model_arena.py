@@ -189,13 +189,10 @@ class ModelArenaScreen(BaseScreen):
     ModelArenaScreen #ma-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     ModelArenaScreen #ma-models {
         height: auto;
         max-height: 10;
-        border: round $panel;
-        border-title-color: $primary;
     }
     ModelArenaScreen #ma-models-note { height: 1; color: $text-muted; }
     ModelArenaScreen #ma-setup { height: 3; }
@@ -212,16 +209,9 @@ class ModelArenaScreen(BaseScreen):
         border: round $primary;
         padding: 0 1;
     }
-    ModelArenaScreen .ma-pane-label {
-        height: 1;
-        text-style: bold;
-        color: $accent;
-    }
     ModelArenaScreen #ma-log {
         width: 30%;
         height: 1fr;
-        border: round $panel;
-        border-title-color: $primary;
     }
     ModelArenaScreen #ma-summary { display: none; height: 1fr; }
     ModelArenaScreen #ma-scroll { height: 1fr; padding: 0 1; }
@@ -292,8 +282,6 @@ class ModelArenaScreen(BaseScreen):
             self.query_one("#ma-modes", OptionList).add_option(
                 Option(Text.assemble((f"  {title}", "bold"), (f"  -  {desc}", MUTED)), id=key))
         self.query_one("#ma-modes", OptionList).highlighted = 0
-        self.query_one("#ma-models", OptionList).border_title = "competitors"
-        self.query_one("#ma-log", RichLog).border_title = "log"
         self.query_one("#ma-models-note", Static).update(
             "space: toggle model (min 2)   enter: also toggles   r: run when ready")
 
@@ -376,10 +364,8 @@ class ModelArenaScreen(BaseScreen):
         self._pane_bodies: List[Static] = []
         for i, (key, ip_port, name, s) in enumerate(models):
             from textual.containers import Vertical as V
-            lab = self._labels[i]
             body = Static("…", id=f"pane-body-{i}")
             pane = V(
-                Static(f"  {lab}  ", classes="ma-pane-label"),
                 body,
                 classes="ma-pane", id=f"pane-{i}",
             )

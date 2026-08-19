@@ -18,7 +18,6 @@ class DiscoveryScreen(BaseScreen):
     DiscoveryScreen #disc-header {
         height: 3;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     DiscoveryScreen #scan-status {
         height: 1;

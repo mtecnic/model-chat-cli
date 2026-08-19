@@ -19,7 +19,6 @@ class SettingsScreen(BaseScreen):
     SettingsScreen #set-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     SettingsScreen VerticalScroll { height: 1fr; padding: 0 2; }
     SettingsScreen .set-section {

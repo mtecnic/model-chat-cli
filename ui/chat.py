@@ -17,7 +17,7 @@ from client import ModelClient
 from think_parser import ChunkType, parsed_chat_stream
 from ui.base import BaseScreen, MUTED
 
-USER_LABEL = "#4cc9f0"
+USER_LABEL = "blue"
 
 COMMANDS = {
     "/help": "show chat commands",

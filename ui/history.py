@@ -61,7 +61,6 @@ class HistoryScreen(BaseScreen):
     HistoryScreen #hist-header {
         height: 2;
         content-align: center middle;
-        border-bottom: solid $panel;
     }
     HistoryScreen OptionList { height: 1fr; }
     HistoryScreen #hist-filter {

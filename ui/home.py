@@ -25,7 +25,6 @@ class HomeScreen(BaseScreen):
         height: 4;
         content-align: center middle;
         text-style: bold;
-        border-bottom: solid $panel;
     }
     HomeScreen #home-current {
         height: 1;
@@ -37,7 +36,6 @@ class HomeScreen(BaseScreen):
         width: 70%;
         align: center middle;
         padding: 0 1;
-        border: round $panel;
     }
     HomeScreen #home-hints {
         height: 3;
