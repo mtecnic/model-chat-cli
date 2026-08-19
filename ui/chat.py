@@ -1,421 +1,502 @@
-"""Chat view for conversing with selected model."""
-import asyncio
-from rich.console import Console
-from rich.panel import Panel
+"""Chat screen - streaming conversation with slash commands."""
+from __future__ import annotations
+
+import time
+from typing import List, Optional
+
 from rich.text import Text
-from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.formatted_text import HTML
+from textual import work
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widget import Widget
+from textual.widgets import Button, Input, Markdown, Static, TextArea
 
 from client import ModelClient
-from storage.history import ChatHistoryManager
-from ui.components import format_stats_line, estimate_tokens
-from think_parser import parsed_chat_stream, ChunkType
+from think_parser import ChunkType, parsed_chat_stream
+from ui.base import BaseScreen, MUTED
+
+USER_LABEL = "#4cc9f0"
+
+COMMANDS = {
+    "/help": "show chat commands",
+    "/quit": "back to menu",
+    "/q": "back to menu",
+    "/switch": "pick another model",
+    "/clear": "clear this conversation",
+    "/system": "set the system prompt",
+    "/think": "toggle thinking mode",
+    "/export": "save this conversation",
+    "/publish": "save + publish this conversation",
+    "/stress": "open the stress lab",
+    "/arena": "open the model arena",
+    "/promptarena": "open the prompt arena",
+}
 
 
-class ChatView:
-    """Handle chat interface with streaming responses."""
+class AssistantMessage(Widget):
+    """One assistant reply: dim thinking block + markdown body + stats line.
 
-    def __init__(self, console: Console, server: dict, model: str):
-        self.console = console
-        self.server = server
-        self.model = model
-        self.client = ModelClient(server, model)
-        self.history = []
-        self.session = PromptSession()
+    While streaming, the body is a plain Static (fast, no markdown re-parse).
+    On completion it is swapped for a Markdown widget so code blocks get
+    syntax highlighting (the original Rich behavior, without the lock issue).
+    """
 
-        # Token per second tracking
-        self.tps_samples = []
-        self.avg_tps = 0.0
+    DEFAULT_CSS = """
+    AssistantMessage {
+        width: 100%;
+        height: auto;
+        padding: 0 1;
+    }
+    AssistantMessage #am-think {
+        width: 100%;
+        height: auto;
+        display: none;
+    }
+    AssistantMessage #am-body {
+        width: 100%;
+        height: auto;
+    }
+    AssistantMessage #am-stats {
+        width: 100%;
+        height: auto;
+        display: none;
+    }
+    """
 
-        # System prompt
+    def __init__(self) -> None:
+        super().__init__()
+        self.thinking = ""
+        self.body = ""
+        self.error: Optional[str] = None
+        self._t0: Optional[float] = None
+        self._ttft: Optional[float] = None
+        self._first_seen = False
+        self._flush_at = 0.0
+        self._content_tokens = 0
+        self._body_widget: Optional[Widget] = None
+        self._finished = False
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="am-think")
+        yield Static("…", id="am-body", classes="streaming")
+        yield Static("", id="am-stats")
+
+    async def on_mount(self) -> None:
+        self._body_widget = self.query_one("#am-body")
+        if self.thinking:
+            t = self.query_one("#am-think")
+            t.update(Text(self.thinking, style="italic dim"))
+            t.styles.display = "block"
+        if self._finished:
+            await self._finalize_body()
+
+    # -- streaming ------------------------------------------------------- #
+    def add_chunk(self, text: str, is_thinking: bool) -> None:
+        now = time.monotonic()
+        if self._t0 is None:
+            self._t0 = now
+        if not is_thinking and not self._first_seen and text:
+            self._first_seen = True
+            self._ttft = now - (self._t0 if self._t0 else now)
+        if is_thinking:
+            self.thinking += text
+            t = self.query_one("#am-think")
+            t.update(Text(self.thinking, style="italic dim"))
+            t.styles.display = "block"
+        else:
+            self.body += text
+            self._content_tokens += 1
+        if now - self._flush_at >= 0.1:
+            self._flush_at = now
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._body_widget is not None and not self._finished:
+            self._body_widget.update(Text(self.body or "…",
+                                          style="dim" if not self.body else "default"))
+
+    async def _finalize_body(self) -> None:
+        """Swap the streaming Static for a Markdown widget."""
+        if self._finished or self._body_widget is None:
+            return
+        self._finished = True
+        content = (self.body or "").strip()
+        md = Markdown(content if content else "*(empty)*")
+        stats = self.query_one("#am-stats")
+        await self._body_widget.remove()
+        await self.mount(md, before=stats)
+        self._body_widget = md
+
+    async def set_metrics(self, tokens: int, tps: float, ttft: float, total: float) -> None:
+        if tokens:
+            self._content_tokens = tokens
+        self._finalize_body()
+        bits = []
+        if tokens:
+            bits.append(f"{tokens} tok")
+        if total:
+            bits.append(f"{total:.1f}s")
+        if tps:
+            bits.append(f"{tps:.0f} t/s")
+        if ttft:
+            bits.append(f"TTFT {ttft:.2f}s")
+        if self.error:
+            bits.append(f"[{self.error}]")
+        stats = self.query_one("#am-stats")
+        stats.update(Text("  ".join(bits), style=MUTED))
+        stats.styles.display = "block"
+
+    async def fail(self, msg: str) -> None:
+        self.error = msg
+        await self._finalize_body()
+        stats = self.query_one("#am-stats")
+        stats.update(Text(msg, style="bright_red"))
+        stats.styles.display = "block"
+
+    async def mark_stopped(self) -> None:
+        await self._finalize_body()
+        elapsed = (time.monotonic() - self._t0) if self._t0 else 0.0
+        stats = self.query_one("#am-stats")
+        stats.update(Text(f"[stopped]   {elapsed:.1f}s", style=MUTED))
+        stats.styles.display = "block"
+
+    @classmethod
+    def from_record(cls, content: str, thinking: str = "") -> "AssistantMessage":
+        """Build a static message from a stored conversation record."""
+        am = cls()
+        am.body = content
+        am.thinking = thinking
+        am._finished = True
+        return am
+
+
+class SystemPromptModal(ModalScreen):
+    DEFAULT_CSS = """
+    SystemPromptModal {
+        align: center middle;
+    }
+    SystemPromptModal > Vertical {
+        width: 70;
+        height: 24;
+        border: round $primary;
+        padding: 1 2;
+    }
+    SystemPromptModal TextArea {
+        height: 1fr;
+    }
+    SystemPromptModal > Vertical > Horizontal {
+        height: 3;
+        content-align: right middle;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self.current = current
+        self.result: Optional[str] = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static("System prompt (applies to new turns)", style="bold")
+            yield TextArea(self.current or "", id="sys-area")
+            with Horizontal():
+                yield Button("Save", id="sys-save", variant="primary")
+                yield Button("Cancel", id="sys-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "sys-save":
+            self.result = self.query_one("#sys-area", TextArea).text
+            self.dismiss()
+        else:
+            self.dismiss()
+
+    def action_cancel(self) -> None:
+        self.dismiss()
+
+
+class ChatScreen(BaseScreen):
+    DEFAULT_CSS = """
+    ChatScreen #chat-messages {
+        height: 1fr;
+        padding: 1 1;
+    }
+    ChatScreen #chat-input {
+        height: 3;
+        width: 100%;
+        margin: 0;
+    }
+    ChatScreen #chat-cmds {
+        height: 1;
+        width: 60%;
+        margin: 0;
+        color: $text-muted;
+    }
+    ChatScreen #chat-hints {
+        height: 2;
+        content-align: center middle;
+        width: 100%;
+        color: $text-muted;
+    }
+    .msg-user {
+        width: 100%;
+        padding: 0 1;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "interrupt", "Stop", show=False),
+        Binding("ctrl+t", "toggle_think", "Think", show=False),
+        Binding("ctrl+l", "back", "Menu", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: List[dict] = []
         self.system_prompt = ""
+        self._worker: Optional[work.Worker] = None
 
-        # Thinking mode toggle
-        self.thinking_enabled = False
+    def build_content(self) -> ComposeResult:
+        yield VerticalScroll(id="chat-messages")
+        yield Static("", id="chat-hints")
+        yield Static("", id="chat-cmds")
+        yield Input(placeholder="Ask the model…  (/help for commands)", id="chat-input")
 
-    async def run(self):
-        """Run the chat interface."""
-        self._print_header()
-        self._print_welcome()
+    def on_mount(self) -> None:
+        app = self.app
+        box = self.query_one("#chat-messages", VerticalScroll)
+        if self.messages:
+            for m in self.messages:
+                self._add_user_widget(m["role"], m.get("content", ""))
+        else:
+            app = self.app
+            t = Text(justify="center")
+            t.append("Chatting with ", style=MUTED)
+            t.append(f"{app.model}", style="bright_cyan bold")
+            if app.server:
+                t.append(f" @ {app.server['ip']}:{app.server['port']}", style=MUTED)
+            t.append("\n\n", )
+            t.append("/help for commands    ·    esc while streaming = stop", style=MUTED)
+            box.mount(Static(t))
+        self.system_prompt = self._load_system_prompt()
+        self.query_one("#chat-hints", Static).update(
+            f"think: {'on' if app.thinking else 'off'} (ctrl+t)   ·   ctrl+l: menu   ·   esc: stop stream"
+        )
+        self.query_one("#chat-input", Input).focused = True
 
-        while True:
-            try:
-                with patch_stdout():
-                    user_input = await self.session.prompt_async(
-                        HTML('<ansicyan><b>&gt; </b></ansicyan>'),
-                        multiline=False
-                    )
+    def _load_system_prompt(self) -> str:
+        return self.app.config.get("chat.system_prompt", "")
 
-                user_input = user_input.strip()
-                if not user_input:
-                    continue
+    # ------------------------------------------------------------------ #
+    # input
+    # ------------------------------------------------------------------ #
 
-                # Handle commands
-                if user_input.startswith("/"):
-                    command_result = await self._handle_command(user_input)
-                    if command_result == "quit":
-                        break
-                    elif command_result == "switch":
-                        return "switch"
-                    elif command_result == "stress_test":
-                        return "stress_test"
-                    elif command_result == "arena":
-                        return "arena"
-                    elif command_result == "prompt_arena":
-                        return "prompt_arena"
-                    continue
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text:
+            return
+        if text.startswith("/"):
+            self._handle_command(text)
+        else:
+            self.query_one("#chat-input", Input).value = ""
+            self._send(text)
+        if self._worker and self._worker.is_running:
+            return
+        self.query_one("#chat-input", Input).focused = True
 
-                # Add user message to history
-                self.history.append({"role": "user", "content": user_input})
+    def on_input_changed(self, event: Input.Changed) -> None:
+        v = event.value
+        if v.startswith("/") and len(v) >= 1:
+            matches = [c for c in sorted(COMMANDS) if c.startswith(v)][:6]
+            self.query_one("#chat-cmds", Static).update(
+                "  ".join(f"{c} {COMMANDS[c]}" for c in matches) if matches else ""
+            )
+        else:
+            self.query_one("#chat-cmds", Static).update("")
 
-                # Print user message inline
-                self._print_user_message(user_input)
-
-                # Stream assistant response
-                await self._stream_response(user_input)
-
-            except KeyboardInterrupt:
-                self.console.print("\n  [chrome]Q to quit, M for menu, Enter to continue[/chrome]")
-                try:
-                    confirm = await self.session.prompt_async(
-                        HTML('<ansicyan><b>&gt; </b></ansicyan>')
-                    )
-                    confirm = confirm.strip().lower()
-                    if confirm == 'q':
-                        return "quit"
-                    elif confirm == 'm':
-                        return "switch"
-                except (KeyboardInterrupt, EOFError):
-                    return "quit"
-                continue
-            except EOFError:
-                self.console.print("\n  [chrome]Returning to menu...[/chrome]")
-                return "switch"
-
-    async def _stream_response(self, message: str):
-        """Stream the assistant's response with direct stdout writes."""
-        import time
-        import sys
-
-        thinking_text = ""
-        content_text = ""
-        request_start = time.time()
-        first_token_time = None
-        end_time = None
-        token_count = 0
-        interrupted = False
-        was_thinking = False
-
-        messages_with_system = self._build_message_history()
-
-        try:
-            # Print assistant label
-            label = Text("  Assistant ", style="role.assistant")
-            label.append("\u25b8", style="chrome")
-            self.console.print(label)
-
-            # Stream chunks directly to stdout — Rich.Live freezes on long output
-            # due to lock contention between its refresh thread and the async loop
-            try:
-                stream = parsed_chat_stream(
-                    self.client.chat_stream(
-                        None, messages_with_system,
-                        enable_thinking=self.thinking_enabled,
-                    ),
-                    start_thinking=self.thinking_enabled,
-                )
-                async for chunk in stream:
-                    if first_token_time is None:
-                        first_token_time = time.time()
-                    if chunk.chunk_type == ChunkType.THINKING:
-                        if not was_thinking:
-                            # Entering thinking — italic only (content stays normal)
-                            sys.stdout.write("\033[3m")
-                            was_thinking = True
-                        thinking_text += chunk.text
-                        sys.stdout.write(chunk.text)
-                        sys.stdout.flush()
-                    else:
-                        if was_thinking:
-                            # Leaving thinking — reset style, add separator
-                            sys.stdout.write("\033[0m\n\n")
-                            was_thinking = False
-                        content_text += chunk.text
-                        sys.stdout.write(chunk.text)
-                        sys.stdout.flush()
-                end_time = time.time()
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                end_time = time.time()
-                interrupted = True
-                content_text += "\n\n(interrupted)"
-
-            # Reset any lingering ANSI style
-            if was_thinking:
-                sys.stdout.write("\033[0m")
-            sys.stdout.write('\n')
-            sys.stdout.flush()
-
-            # If thinking was enabled but model didn't actually think
-            # (no </think> seen, all text classified as thinking), treat as content
-            if thinking_text and not content_text:
-                content_text = thinking_text
-                thinking_text = ""
-
-            # Estimate tokens once after streaming (content only for stats)
-            token_count = estimate_tokens(content_text)
-            think_token_count = estimate_tokens(thinking_text) if thinking_text else 0
-
-            # Decode tok/s: generated tokens / time from first token → last token.
-            # Excludes TTFT (queue + prompt eval + network RTT) so the number
-            # reflects actual model decode speed, matching stress_tester's decode_tps.
-            if end_time is None:
-                end_time = time.time()
-            ttft = first_token_time - request_start if first_token_time else 0.0
-            decode_elapsed = (end_time - first_token_time) if first_token_time else 0.0
-            total_generated = token_count + think_token_count
-            current_tps = 0
-            if decode_elapsed > 0 and total_generated > 0:
-                current_tps = total_generated / decode_elapsed
-                self.tps_samples.append(current_tps)
-                if len(self.tps_samples) > 10:
-                    self.tps_samples.pop(0)
-                self.avg_tps = sum(self.tps_samples) / len(self.tps_samples)
-
-            # Print stats line
-            if content_text or thinking_text:
-                if current_tps > 0 and not interrupted:
-                    stats = format_stats_line(
-                        token_count,
-                        decode_elapsed,
-                        current_tps,
-                        ttft=ttft,
-                        think_tokens=think_token_count if self.thinking_enabled else None,
-                    )
-                    self.console.print(stats)
-                self.console.print()
-                entry = {"role": "assistant", "content": content_text}
-                if thinking_text:
-                    entry["thinking"] = thinking_text
-                self.history.append(entry)
-
-            if interrupted:
-                raise KeyboardInterrupt()
-
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            self.console.print(f"  [status.error]Error: {str(e)}[/status.error]")
-            self.console.print()
-
-    async def _handle_command(self, command: str) -> str:
-        """Handle special commands."""
-        cmd = command.lower().split()[0]
-
+    def _handle_command(self, text: str) -> None:
+        cmd = text.split()[0].lower()
+        app = self.app
         if cmd in ("/quit", "/q"):
-            self.console.print("  [chrome]Goodbye![/chrome]")
-            return "quit"
-
+            app.pop_screen()
         elif cmd == "/switch":
-            self.console.print("  [chrome]Switching models...[/chrome]")
-            return "switch"
-
+            app.pop_screen()
+            app.push_screen("discovery")
         elif cmd == "/clear":
-            self.history = []
-            self.tps_samples = []
-            self.avg_tps = 0.0
-            self._refresh_display()
-            self.console.print("  [status.ok]Conversation cleared.[/status.ok]")
-            self.console.print()
-
-        elif cmd == "/export":
-            filename = await self._export_conversation()
-            if filename:
-                self.console.print(f"  [status.ok]Exported to {filename}[/status.ok]")
-            self.console.print()
-
+            self.messages = []
+            box = self.query_one("#chat-messages", VerticalScroll)
+            box.remove_children()
+            self.notify("Conversation cleared", severity="info", timeout=2)
         elif cmd == "/system":
-            await self._handle_system_prompt()
-
-        elif cmd == "/stress":
-            return "stress_test"
-
-        elif cmd == "/arena":
-            return "arena"
-
-        elif cmd == "/promptarena":
-            return "prompt_arena"
-
+            app.push_screen(
+                SystemPromptModal(self.system_prompt),
+                callback=lambda result: self._system_saved(result),
+            )
         elif cmd == "/think":
-            self.thinking_enabled = not self.thinking_enabled
-            state = "ON" if self.thinking_enabled else "OFF"
-            style = "status.ok" if self.thinking_enabled else "chrome"
-            self.console.print(f"  [{style}]Thinking: {state}[/{style}]")
-            self.console.print()
-
+            app.thinking = not app.thinking
+            self.query_one("#chat-hints", Static).update(
+                f"think: {'on' if app.thinking else 'off'} (ctrl+t)   ·    ctrl+l: menu   ·   esc: stop stream"
+            )
+            self.notify(f"Thinking mode: {'on' if app.thinking else 'off'}",
+                        severity="info", timeout=2)
+        elif cmd == "/export":
+            self._do_export()
+        elif cmd == "/publish":
+            self._do_export(publish=True)
+        elif cmd in ("/stress",):
+            app.pop_screen()
+            app.push_screen("stress")
+        elif cmd in ("/arena",):
+            app.pop_screen()
+            app.push_screen("model_arena")
+        elif cmd in ("/promptarena",):
+            app.pop_screen()
+            app.push_screen("prompt_arena")
         elif cmd == "/help":
-            self.console.print()
-            self.console.print("  [accent.bold]Commands[/accent.bold]")
-            self.console.print("  [accent]/quit[/accent], [accent]/q[/accent]     Exit")
-            self.console.print("  [accent]/switch[/accent]       Switch model")
-            self.console.print("  [accent]/clear[/accent]        Clear history")
-            self.console.print("  [accent]/export[/accent]       Export to markdown")
-            self.console.print("  [accent]/system[/accent]       System prompt")
-            self.console.print("  [accent]/think[/accent]        Toggle reasoning mode")
-            self.console.print("  [accent]/stress[/accent]       Stress test")
-            self.console.print("  [accent]/arena[/accent]        Multi-model arena (side by side)")
-            self.console.print("  [accent]/promptarena[/accent]  Prompt comparison tournament")
-            self.console.print()
-            self.console.print("  [chrome]Ctrl+D[/chrome] back  [chrome]Ctrl+C[/chrome] quit")
-            self.console.print()
-
+            t = Text()
+            for c in sorted(COMMANDS):
+                t.append(f"  {c:<14}", style="bold")
+                t.append(COMMANDS[c] + "\n", style=MUTED)
+            t.append("\n  ctrl+t toggle thinking · esc stop stream · ctrl+l menu", style=MUTED)
+            self.app.notify(t, title="Chat commands", severity="information", timeout=15, markup=False)
         else:
-            self.console.print(f"  [status.warn]Unknown command: {cmd}[/status.warn]")
-            self.console.print("  [chrome]Type /help for commands[/chrome]")
-            self.console.print()
+            self.notify(f"unknown command {cmd} — try /help", severity="warning", timeout=3)
 
-        return "continue"
+    def _system_saved(self, result) -> None:
+        if result is None:
+            return
+        self.system_prompt = result
+        self.app.config.set("chat.system_prompt", result)
+        self.app.config.save()
+        self.notify("System prompt saved", title="System", severity="success", timeout=3)
 
-    def _print_header(self):
-        """Print the chat header."""
-        server_addr = f"{self.server['ip']}:{self.server['port']}"
-        header = Text()
-        header.append(self.model, style="model.name")
-        header.append("  ", style="chrome")
-        header.append(server_addr, style="model.server")
-        if self.thinking_enabled:
-            header.append("  think", style="status.ok")
-        self.console.print()
-        self.console.rule(header, style="chrome.border")
-        self.console.print()
+    # ------------------------------------------------------------------ #
+    # streaming
+    # ------------------------------------------------------------------ #
 
-    def _print_welcome(self):
-        """Print the welcome hint."""
-        self.console.print("  [chrome.muted]Type a message to begin. /help for commands.[/chrome.muted]")
-        self.console.print()
+    def _add_user_widget(self, role: str, content: str, thinking: str = "") -> None:
+        box = self.query_one("#chat-messages", VerticalScroll)
+        if role == "user":
+            t = Text()
+            t.append("you →  ", style=f"bold {USER_LABEL}")
+            t.append(content)
+            box.mount(Static(t, classes="msg-user"))
+        elif role == "assistant":
+            box.mount(AssistantMessage.from_record(content, thinking))
+        box.scroll_end(animate=False, force=True)
 
-    def _print_user_message(self, text: str):
-        """Print a user message inline."""
-        self.console.print()
-        label = Text("  You ", style="role.user")
-        label.append("\u25b8 ", style="chrome")
-        self.console.print(label)
-        for line in text.split('\n'):
-            self.console.print(f"  {line}")
-        self.console.print()
+    def _send(self, text: str) -> None:
+        app = self.app
+        if not app.model or not app.server:
+            self.notify("No model selected", severity="warning", timeout=3)
+            return
+        self.messages.append({"role": "user", "content": text})
+        box = self.query_one("#chat-messages", VerticalScroll)
+        t = Text()
+        t.append("you →  ", style=f"bold {USER_LABEL}")
+        t.append(text)
+        box.mount(Static(t, classes="msg-user"))
+        am = AssistantMessage()
+        box.mount(am)
+        box.scroll_end(animate=False, force=True)
 
-    def _refresh_display(self):
-        """Clear screen and reprint header. Used only for /clear."""
-        self.console.clear()
-        self._print_header()
-        self._print_welcome()
-
-    def _build_message_history(self) -> list:
-        """Build message history with system prompt if set."""
-        messages = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.extend(self.history)
-        return messages
+            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
 
-    async def _handle_system_prompt(self):
-        """Handle system prompt view/edit."""
-        if self.system_prompt:
-            self.console.print()
-            self.console.print("  [accent.bold]System Prompt[/accent.bold]")
-            self.console.print(f"  {self.system_prompt}")
-            self.console.print()
+        self._current_am = am
+        self._worker = self.run_worker(
+            self._stream_worker(text, am),
+            name="chat",
+            group="chat",
+            exclusive=True,
+        )
 
-            with patch_stdout():
-                action = await self.session.prompt_async(
-                    HTML('<ansicyan>  E to edit, C to clear, Enter to keep: </ansicyan>')
-                )
-            action = action.strip().lower()
-
-            if action == 'e':
-                self.console.print("  [chrome]Enter new system prompt (empty line when done):[/chrome]")
-                lines = []
-                try:
-                    with patch_stdout():
-                        while True:
-                            line = await self.session.prompt_async("  ")
-                            if not line:
-                                break
-                            lines.append(line)
-                except EOFError:
-                    pass
-                new_prompt = "\n".join(lines).strip()
-                if new_prompt:
-                    self.system_prompt = new_prompt
-                    self.console.print("  [status.ok]System prompt updated.[/status.ok]")
-                else:
-                    self.console.print("  [chrome]System prompt unchanged.[/chrome]")
-
-            elif action == 'c':
-                self.system_prompt = ""
-                self.console.print("  [status.ok]System prompt cleared.[/status.ok]")
-
-            self.console.print()
-
-        else:
-            self.console.print("  [chrome]No system prompt set. Enter one (empty line when done):[/chrome]")
-            lines = []
-            try:
-                with patch_stdout():
-                    while True:
-                        line = await self.session.prompt_async("  ")
-                        if not line:
-                            break
-                        lines.append(line)
-            except EOFError:
-                pass
-            new_prompt = "\n".join(lines).strip()
-            if new_prompt:
-                self.system_prompt = new_prompt
-                self.console.print("  [status.ok]System prompt set.[/status.ok]")
-                self.console.print(f"  [chrome]{self.system_prompt}[/chrome]")
-            else:
-                self.console.print("  [chrome]No system prompt set.[/chrome]")
-            self.console.print()
-
-    async def _export_conversation(self) -> str:
-        """Export conversation to markdown file."""
-        if not self.history:
-            self.console.print("  [status.warn]No conversation to export.[/status.warn]")
-            return None
-
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"chat_{self.model.replace('/', '_')}_{timestamp}.md"
-
+    async def _stream_worker(self, text: str, am: AssistantMessage) -> None:
+        app = self.app
+        # history = everything before the current user turn (system prompt + prior turns)
+        history = self.messages[:-1]
+        client = ModelClient(app.server, app.model)
+        full = ""
+        t_start = time.monotonic()
         try:
-            with open(filename, "w") as f:
-                f.write(f"# Chat with {self.model}\n\n")
-                f.write(f"Server: {self.server['ip']}:{self.server['port']}\n")
-                f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                if self.system_prompt:
-                    f.write(f"**System Prompt:** {self.system_prompt}\n\n")
-                f.write("---\n\n")
-                for msg in self.history:
-                    role = msg["role"].upper()
-                    content = msg["content"]
-                    if role == "ASSISTANT" and msg.get("thinking"):
-                        f.write(f"## {role}\n\n")
-                        f.write(f"<details>\n<summary>Thinking</summary>\n\n{msg['thinking']}\n\n</details>\n\n")
-                        f.write(f"{content}\n\n")
-                    else:
-                        f.write(f"## {role}\n\n{content}\n\n")
-
-            try:
-                ChatHistoryManager().save_conversation(
-                    model=self.model,
-                    server=f"{self.server['ip']}:{self.server['port']}",
-                    messages=self.history,
-                )
-            except Exception as e:
-                self.console.print(f"  [status.warn]History persist failed: {e}[/status.warn]")
-
-            return filename
+            stream = client.chat_stream(text, history, enable_thinking=app.thinking)
+            async for chunk in parsed_chat_stream(stream, start_thinking=app.thinking):
+                is_think = chunk.chunk_type == ChunkType.THINKING
+                am.add_chunk(chunk.text, is_think)
+                full += chunk.text if not is_think else ""
         except Exception as e:
-            self.console.print(f"  [status.error]Failed to export: {e}[/status.error]")
-            return None
+            await am.fail(str(e))
+            return
+        t_end = time.monotonic()
+        total = t_end - t_start
+        m = client.last_metrics
+        tokens = m.completion_tokens or am._content_tokens
+        tps = tokens / total if total > 0 and tokens else 0.0
+        ttft = m.ttft or am._ttft or 0.0
+        await am.set_metrics(tokens, tps, ttft, total)
+
+        content = am.body.strip()
+        thinking = am.thinking.strip()
+        rec = {"role": "assistant", "content": content or full.strip()}
+        if thinking:
+            rec["thinking"] = thinking
+        self.messages.append(rec)
+        box = self.query_one("#chat-messages", VerticalScroll)
+        box.scroll_end(animate=False, force=True)
+
+    def _do_export(self, publish: bool = False) -> None:
+        if len(self.messages) < 1:
+            self.notify("Nothing to export yet", severity="info", timeout=2)
+            return
+        msgs = [m for m in self.messages if m["role"] != "system"]
+        path = self.app.save_chat(msgs, self.system_prompt)
+        if path:
+            self.notify(f"Saved: {path}", title="Exported", severity="success", timeout=5)
+            if publish:
+                self.run_worker(self._publish_file(path), name="publish-chat")
+
+    async def _publish_file(self, path) -> None:
+        from publish import Publisher
+        cfg = self.app.config
+        pub = Publisher(
+            cfg.get("github.repo_path", ""),
+            branch=cfg.get("github.branch", "main"),
+            prefix=cfg.get("github.prefix", "results"),
+            push=cfg.get("github.push", True),
+            dry_run=cfg.get("github.dry_run", False),
+        )
+        ok, desc = pub.validate()
+        if not ok:
+            self.app.notify(f"Publish failed: {desc}", severity="error", timeout=5)
+            return
+        rel = f"{str(cfg.get('github.prefix', 'results')).strip('/')}/{path.name}"
+        result = await pub.publish([path], rel_paths=[rel],
+                                   commit_message=f"results: chat {self.app.model}")
+        self.app.notify(result.summary(),
+                        title="Publish" + (" (dry-run)" if result.dry_run else ""),
+                        severity="success" if result.ok else "error", timeout=6)
+
+    # ------------------------------------------------------------------ #
+    # keys
+    # ------------------------------------------------------------------ #
+
+    async def action_interrupt(self) -> None:
+        if self._worker and self._worker.is_running:
+            self._worker.cancel()
+            self.notify("Stopped", severity="info", timeout=2)
+            am = getattr(self, "_current_am", None)
+            if am is not None and not am.error:
+                await am.mark_stopped()
+
+    def action_toggle_think(self) -> None:
+        self.app.thinking = not self.app.thinking
+        self._handle_command("/think")
+
+    def action_back(self) -> None:
+        self.app.pop_screen()

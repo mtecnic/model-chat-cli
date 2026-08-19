@@ -13,7 +13,7 @@ import httpx
 
 from client import ModelClient, ChatMetrics
 from logger import setup_logger, log_request_error, log_test_summary, log_vllm_error
-from ui.components import estimate_tokens
+from client import estimate_tokens
 from think_parser import split_thinking
 
 

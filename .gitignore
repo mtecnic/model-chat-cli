@@ -14,10 +14,12 @@ ENV/
 logs/
 *.log
 
-# Storage and cache
-storage/
+# Cache
 *.cache
 .model_chat_cache.json
+
+# exports live outside the repo (~/.model_chat/exports); keep stray legacy
+# result files in the working dir out of version control
 
 # Local exports (chat / arena / stress results)
 arena_*.md

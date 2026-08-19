@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Callable, Any
 
 from client import ModelClient
 from logger import setup_logger
-from ui.components import estimate_tokens
+from client import estimate_tokens
 
 
 # =============================================================================

@@ -646,3 +646,100 @@ class ModelClient:
                             continue
 
         return full_response, metrics
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count in a single pass, unicode-aware.
+
+    Handles CJK (each char ~ 1 token), emoji grapheme clusters (~ 2-3 tokens
+    per visible emoji regardless of codepoint count), Latin words (~ 1.3 tokens),
+    and skips zero-width / format characters.
+    """
+    import unicodedata
+
+    if not text:
+        return 0
+
+    tokens = 0.0
+    newlines = 0
+    in_latin_word = False
+    in_emoji_seq = False  # tracks ZWJ / modifier sequences as one unit
+
+    def _flush_latin():
+        nonlocal tokens, in_latin_word
+        if in_latin_word:
+            tokens += 1.3
+            in_latin_word = False
+
+    def _is_emoji_component(c, cp):
+        """Check if codepoint is part of an emoji sequence."""
+        cat = unicodedata.category(c)
+        # Symbol-Other (most emoji), Modifier-Symbol, skin tone modifiers,
+        # regional indicators, variation selectors, keycap combining
+        if cat in ('So', 'Sk'):
+            return True
+        if 0x1F3FB <= cp <= 0x1F3FF:  # skin tone modifiers
+            return True
+        if 0x1F1E0 <= cp <= 0x1F1FF:  # regional indicator symbols (flags)
+            return True
+        if cp in (0xFE0E, 0xFE0F):  # variation selectors
+            return True
+        if 0xE0020 <= cp <= 0xE007F:  # tag characters (flag subdivision)
+            return True
+        if 0x20E3 == cp:  # combining enclosing keycap
+            return True
+        return False
+
+    for c in text:
+        cp = ord(c)
+
+        # Zero-width joiners / format chars — extend current emoji sequence
+        if cp in (0x200D, 0x200B, 0x200C, 0xFEFF, 0x00AD) or unicodedata.category(c) == 'Cf':
+            # ZWJ keeps the emoji sequence alive; others are just skipped
+            continue
+
+        if _is_emoji_component(c, cp):
+            _flush_latin()
+            if not in_emoji_seq:
+                in_emoji_seq = True
+                # Will be counted when sequence ends
+            continue
+
+        # Non-emoji char: close any open emoji sequence
+        if in_emoji_seq:
+            tokens += 2.5  # one visible emoji cluster ~ 2-3 BPE tokens
+            in_emoji_seq = False
+
+        if c == '\n':
+            newlines += 1
+            _flush_latin()
+
+        elif c.isspace():
+            _flush_latin()
+
+        elif '\u4E00' <= c <= '\u9FFF' or '\u3400' <= c <= '\u4DBF' or \
+             '\uF900' <= c <= '\uFAFF' or '\U00020000' <= c <= '\U0002A6DF':
+            _flush_latin()
+            tokens += 1
+
+        elif '\u3040' <= c <= '\u30FF' or '\u31F0' <= c <= '\u31FF':
+            _flush_latin()
+            tokens += 1
+
+        elif '\uAC00' <= c <= '\uD7AF':
+            _flush_latin()
+            tokens += 1
+
+        elif c.isalnum():
+            in_latin_word = True
+
+        else:
+            _flush_latin()
+            tokens += 0.5
+
+    # Flush trailing state
+    _flush_latin()
+    if in_emoji_seq:
+        tokens += 2.5
+
+    return max(1, int(tokens + newlines))
