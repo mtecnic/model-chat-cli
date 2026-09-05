@@ -3,6 +3,27 @@ from rich.table import Table
 from rich.text import Text
 
 
+def _fmt_context(tokens) -> str:
+    """Format a max context length compactly: 262144 -> 256K, 261888 -> 256K."""
+    try:
+        n = int(tokens)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 1024 * 1024:
+        m = n / (1024 * 1024)
+        return f"{m:.0f}M" if m >= 10 else f"{m:.1f}M"
+    if n >= 1024:
+        return f"{n / 1024:.0f}K"
+    return str(n)
+
+
+def _model_label(model) -> str:
+    """Display name for a model entry (plain string or {name, max_context})."""
+    if isinstance(model, dict):
+        return model.get("name", "unknown")
+    return model
+
+
 def create_model_table(servers: list) -> Table:
     """Create a table displaying discovered models.
 
@@ -11,14 +32,21 @@ def create_model_table(servers: list) -> Table:
 
     Returns:
         Rich Table with all discovered models
+
+    The Model and Server columns shrink first when the terminal is narrow:
+    the server column is right-aligned with overflow="fold", so the last
+    characters of the address (the host's last octet and the port) stay
+    visible when the row can't fit fully.
     """
     table = Table(title="[accent.bold]Discovered Models[/accent.bold]", show_header=True)
-    table.add_column("#", style="chrome", width=4, justify="right")
-    table.add_column("Model", style="model.name", no_wrap=True)
-    table.add_column("Server", style="model.server")
-    table.add_column("Type", style="chrome", justify="center")
-    table.add_column("Status", justify="center", width=8)
-    table.add_column("Latency", justify="right", width=10)
+    table.add_column("#", style="chrome", width=3, justify="right")
+    table.add_column("Model", style="model.name", no_wrap=True, overflow="fold", min_width=10, ratio=3)
+    table.add_column("Server", style="model.server", no_wrap=True, overflow="fold",
+                     justify="right", min_width=18, ratio=2)
+    table.add_column("Ctx", style="chrome", justify="right", no_wrap=True)
+    table.add_column("Type", style="chrome", justify="center", no_wrap=True)
+    table.add_column("Status", justify="center", width=1)
+    table.add_column("Latency", justify="right", width=7)
 
     idx = 1
     for server in servers:
@@ -36,10 +64,16 @@ def create_model_table(servers: list) -> Table:
             server_addr = f"{server['ip']}:{server['port']}"
             server_type = server['type'].upper()
 
+            if isinstance(model, dict) and model.get("max_context"):
+                ctx = _fmt_context(model["max_context"])
+            else:
+                ctx = "\u2022"
+
             table.add_row(
                 str(idx),
-                model,
+                _model_label(model),
                 server_addr,
+                ctx,
                 server_type,
                 status_symbol,
                 latency

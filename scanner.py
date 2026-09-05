@@ -88,7 +88,17 @@ async def probe_server(ip: str, port: int, client: httpx.AsyncClient) -> Optiona
             "port": port,
             "url": base_url,
             "type": "openai",
-            "models": [m.get("id", "unknown") for m in openai_data.get("data", [])],
+            "models": [
+                {
+                    "name": m.get("id", "unknown"),
+                    # vLLM/OpenAI-compatible servers report this per model;
+                    # llama.cpp exposes meta.n_ctx; fall back to server-level field
+                    "max_context": (m.get("max_model_len")
+                                    or (m.get("meta") or {}).get("n_ctx")
+                                    or openai_data.get("max_model_len")),
+                }
+                for m in openai_data.get("data", [])
+            ],
         }
 
     if ollama_data:
@@ -97,7 +107,15 @@ async def probe_server(ip: str, port: int, client: httpx.AsyncClient) -> Optiona
             "port": port,
             "url": base_url,
             "type": "ollama",
-            "models": [m.get("name", "unknown") for m in ollama_data.get("models", [])],
+            "models": [
+                {
+                    "name": m.get("name", "unknown"),
+                    # Ollama reports context length in model_info or the Modelfile
+                    "max_context": (m.get("model_info") or {}).get("context_length")
+                    or m.get("context_length"),
+                }
+                for m in ollama_data.get("models", [])
+            ],
         }
 
     # Fallback: detect Ollama servers with no models pulled via /api/version
