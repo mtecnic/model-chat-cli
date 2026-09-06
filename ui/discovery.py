@@ -5,7 +5,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich.prompt import Prompt
 
 from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache
-from ui.components import create_model_table
+from ui.components import create_model_table, _model_label
 
 
 class DiscoveryView:
@@ -53,7 +53,8 @@ class DiscoveryView:
             self.models = []
             for server in self.servers:
                 for model in server.get("models", []):
-                    self.models.append((server, model))
+                    # models are dicts ({name, max_context}); selection uses the name
+                    self.models.append((server, _model_label(model)))
 
             self.console.print()
             valid_choices = [str(i) for i in range(1, len(self.models) + 1)] + ['r', 'R']

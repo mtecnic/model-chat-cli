@@ -17,7 +17,7 @@ from rich.prompt import Prompt, IntPrompt
 
 from client import ModelClient
 from scanner import load_cache
-from ui.components import format_stats_line, format_menu_item, estimate_tokens
+from ui.components import format_stats_line, format_menu_item, estimate_tokens, _model_label
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -229,6 +229,8 @@ class MultiArenaView:
         if cached:
             for server in cached:
                 for model in server.get("models", []):
+                    # cached models are dicts ({name, max_context}); use the name
+                    model = _model_label(model)
                     key = f"{server['url']}:{model}"
                     if key not in seen:
                         choices.append((server, model))
