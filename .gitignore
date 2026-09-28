@@ -36,3 +36,7 @@ stress_results_*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# AI agent / dev tooling
+CLAUDE.md
+AGENTS.md
