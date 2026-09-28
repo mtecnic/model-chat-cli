@@ -382,3 +382,13 @@ model-chat-cli/
 *No telemetry · No cloud calls · No surprises*
 
 </div>
+
+---
+
+## License
+
+[MIT](LICENSE)
+
+Built on [Rich](https://github.com/Textualize/rich) and
+[prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit) for the terminal
+UI, and [httpx](https://github.com/encode/httpx) for async HTTP — all MIT/BSD licensed.
