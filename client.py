@@ -28,7 +28,11 @@ class ChatMetrics:
     completion_tokens: int = 0
     prompt_eval_duration_ns: int = 0   # Ollama-specific prefill timing
     eval_duration_ns: int = 0          # Ollama-specific decode timing
-    ttft: float = 0.0                  # Time to first content token (seconds)
+    ttft: float = 0.0                  # Time to first token of any kind (seconds)
+
+
+class _StreamOptionsUnsupported(Exception):
+    """Server rejected the stream_options field; retry without it."""
 
 
 class ModelClient:
@@ -67,56 +71,104 @@ class ModelClient:
             "model": self.model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
 
         # Pass thinking toggle for models that support it (e.g. Qwen 3/3.5 on vLLM)
         if enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST",
-                f"{self.url}/v1/chat/completions",
-                json=payload,
-            ) as response:
-                # Use aiter_bytes to avoid line buffering for real-time streaming
-                buffer = b""
-                thinking_active = False
-                async for chunk_bytes in response.aiter_bytes(chunk_size=64):
-                    buffer += chunk_bytes
+        self.last_metrics = ChatMetrics()
+        self.last_metrics._request_start = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.url}/v1/chat/completions",
+                    json=payload,
+                ) as response:
+                    # Some servers reject stream_options outright. Only retry
+                    # without it when the error actually names it -- a 404 here
+                    # is usually an unknown model, and retrying would swallow
+                    # the real error and yield an empty response.
+                    if response.status_code >= 400:
+                        detail = (await response.aread()).decode("utf-8", errors="ignore")
+                        if "stream_options" in detail:
+                            raise _StreamOptionsUnsupported()
+                        response.raise_for_status()
+                    async for text in self._parse_sse_openai(response, self.last_metrics):
+                        yield text
+        except _StreamOptionsUnsupported:
+            payload.pop("stream_options", None)
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.url}/v1/chat/completions",
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    async for text in self._parse_sse_openai(response, self.last_metrics):
+                        yield text
 
-                    # Process all complete lines in buffer
-                    while b"\n" in buffer:
-                        line_bytes, buffer = buffer.split(b"\n", 1)
-                        line = line_bytes.decode('utf-8', errors='ignore').strip()
+    async def _parse_sse_openai(self, response, metrics: ChatMetrics) -> AsyncGenerator[str, None]:
+        """Yield text chunks from an OpenAI SSE stream, filling `metrics`."""
+        # Use aiter_bytes to avoid line buffering for real-time streaming
+        buffer = b""
+        thinking_active = False
+        first_token = True
+        async for chunk_bytes in response.aiter_bytes(chunk_size=64):
+            buffer += chunk_bytes
 
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                if thinking_active:
-                                    yield "</think>"
-                                return
+            # Process all complete lines in buffer
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode('utf-8', errors='ignore').strip()
 
-                            try:
-                                chunk = json.loads(data)
-                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        if thinking_active:
+                            yield "</think>"
+                            thinking_active = False
+                        return
 
-                                # Handle reasoning_content (vLLM/Qwen thinking field)
-                                reasoning = delta.get("reasoning_content", "")
-                                if reasoning:
-                                    if not thinking_active:
-                                        yield "<think>"
-                                        thinking_active = True
-                                    yield reasoning
+                    try:
+                        chunk = json.loads(data)
 
-                                content = delta.get("content", "")
-                                if content:
-                                    if thinking_active:
-                                        yield "</think>"
-                                        thinking_active = False
-                                    yield content
-                            except json.JSONDecodeError:
-                                continue
+                        # Final usage chunk (stream_options.include_usage) has no choices
+                        usage = chunk.get("usage")
+                        if usage:
+                            metrics.prompt_tokens = usage.get("prompt_tokens", 0)
+                            metrics.completion_tokens = usage.get("completion_tokens", 0)
+
+                        delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+
+                        # Reasoning arrives as `reasoning_content` (vLLM --reasoning-parser,
+                        # HF-style) or `reasoning` (NVIDIA/TensorRT-LLM serving).
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                        if reasoning:
+                            if first_token:
+                                metrics.ttft = time.monotonic() - metrics._request_start
+                                first_token = False
+                            if not thinking_active:
+                                yield "<think>"
+                                thinking_active = True
+                            yield reasoning
+
+                        content = delta.get("content", "")
+                        if content:
+                            if first_token:
+                                metrics.ttft = time.monotonic() - metrics._request_start
+                                first_token = False
+                            if thinking_active:
+                                yield "</think>"
+                                thinking_active = False
+                            yield content
+                    except (json.JSONDecodeError, IndexError, AttributeError, TypeError):
+                        continue
+
+        if thinking_active:
+            yield "</think>"
 
     async def _chat_stream_ollama(
         self, message: str, history: Optional[list] = None,
@@ -280,7 +332,7 @@ class ModelClient:
                                     continue
                                 delta = choices[0].get("delta", {})
 
-                                reasoning = delta.get("reasoning_content", "")
+                                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                                 if reasoning:
                                     if not thinking_active:
                                         thinking_active = True
@@ -368,7 +420,7 @@ class ModelClient:
                                 continue
                             delta = choices[0].get("delta", {})
 
-                            reasoning = delta.get("reasoning_content", "")
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                             if reasoning:
                                 if not thinking_active:
                                     thinking_active = True
