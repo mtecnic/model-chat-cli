@@ -11,68 +11,36 @@ from rich.text import Text
 from rich.prompt import IntPrompt, Prompt
 
 from stress_tester import StressTester, TestResult, TestStats
-from ui.components import format_menu_item
+from ui.components import CellGrid, format_menu_item
 from ui.interrupt import run_interruptible
 
 
-class _ResultsGrid:
-    """Width/height-aware grid of request cells for the live dashboard.
+# Single-width glyphs only (emoji like ⏸ ⏳ are double-width in many terminals)
+_ICONS = {"pending": ("\u00b7", "chrome"), "running": ("\u25cf", "status.running"),
+          "success": ("\u2713", "status.ok"), "error": ("\u2717", "status.error")}
 
-    Sizes itself from the space Rich gives it at render time, shows only the
-    newest results that fit, and never wraps a cell, so the dashboard keeps a
-    fixed shape at any terminal size.
-    """
 
-    CELL_MIN_W = 24
-    CELL_H = 4  # border + 2 text lines + border
+def _request_cell(r: TestResult) -> Text:
+    icon, style = _ICONS.get(r.status, ("?", "chrome"))
+    text = Text()
+    text.append(f"#{r.request_id} ", style="accent.bold")
+    text.append(icon, style=style)
+    text.append("\n")
+    if r.status == "success":
+        text.append(f"{r.duration:.1f}s {r.decode_tps:.0f}t/s", style="metric.label")
+        if r.ttft > 0:
+            text.append(f" ttft {r.ttft:.2f}s", style="chrome")
+    elif r.status == "error":
+        text.append(r.error_msg or "error", style="status.error")
+    elif r.status == "running":
+        text.append("streaming...", style="status.running")
+    else:
+        text.append("waiting...", style="chrome")
+    return text
 
-    # Single-width glyphs only (emoji like ⏸ ⏳ are double-width in many terminals)
-    ICONS = {"pending": ("\u00b7", "chrome"), "running": ("\u25cf", "status.running"),
-             "success": ("\u2713", "status.ok"), "error": ("\u2717", "status.error")}
 
-    def __init__(self, results: List[TestResult]):
-        self.results = results
-
-    def _cell(self, r: TestResult) -> Panel:
-        icon, style = self.ICONS.get(r.status, ("?", "chrome"))
-        text = Text(no_wrap=True, overflow="ellipsis")
-        text.append(f"#{r.request_id} ", style="accent.bold")
-        text.append(icon, style=style)
-        text.append("\n")
-        if r.status == "success":
-            text.append(f"{r.duration:.1f}s {r.decode_tps:.0f}t/s", style="metric.label")
-            if r.ttft > 0:
-                text.append(f" ttft {r.ttft:.2f}s", style="chrome")
-        elif r.status == "error":
-            text.append(r.error_msg or "error", style="status.error")
-        elif r.status == "running":
-            text.append("streaming...", style="status.running")
-        else:
-            text.append("waiting...", style="chrome")
-        return Panel(text, height=self.CELL_H, padding=(0, 1), border_style="chrome.border")
-
-    def __rich_console__(self, console, options):
-        width = options.max_width
-        height = options.height or options.max_height or console.height
-        inner_w = max(1, width - 2)
-        inner_h = max(1, height - 2)
-        cols = max(1, inner_w // self.CELL_MIN_W)
-        rows = max(1, inner_h // self.CELL_H)
-        shown = self.results[-(cols * rows):]
-
-        if not shown:
-            body = Text("Waiting for results...", style="chrome")
-        else:
-            body = Table.grid(expand=True)
-            for _ in range(cols):
-                body.add_column(ratio=1, no_wrap=True)
-            for i in range(0, len(shown), cols):
-                cells = [self._cell(r) for r in shown[i:i + cols]]
-                cells += [Text("")] * (cols - len(cells))
-                body.add_row(*cells)
-
-        yield Panel(body, title=f"Conversations ({len(shown)} of {len(self.results)})",
-                    height=height, padding=(0, 0))
+def _results_grid(results: List[TestResult]) -> CellGrid:
+    return CellGrid(results, _request_cell, title="Conversations")
 
 
 class StressTestView:
@@ -530,7 +498,7 @@ class StressTestView:
         )
 
         layout["header"].update(Panel(title, style="accent.bold"))
-        layout["conversations"].update(_ResultsGrid(self.current_results))
+        layout["conversations"].update(_results_grid(self.current_results))
         layout["errors"].update(Panel("[chrome]No errors yet[/chrome]", title="Error Log"))
         layout["footer"].update(self._create_stats_panel(TestStats()))
 
@@ -538,7 +506,7 @@ class StressTestView:
 
     def _update_layout(self, layout: Layout, stats: TestStats):
         """Update layout with current results."""
-        layout["conversations"].update(_ResultsGrid(self.current_results))
+        layout["conversations"].update(_results_grid(self.current_results))
         layout["footer"].update(self._create_stats_panel(stats))
         layout["errors"].update(self._create_errors_panel(stats))
 

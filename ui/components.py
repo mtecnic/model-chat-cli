@@ -1,8 +1,56 @@
 """Reusable Rich components for the Model Chat CLI."""
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+
+class CellGrid:
+    """Width/height-aware grid of small cells for live dashboards.
+
+    Sizes itself from the space Rich gives it at render time, shows only the
+    newest items that fit, and never wraps, so a dashboard keeps a fixed shape
+    at any terminal size. `render_cell(item)` returns the cell's Text (it is
+    placed in a no-wrap Panel of height `cell_h`).
+    """
+
+    def __init__(self, items: Sequence, render_cell: Callable[[object], Text],
+                 title: str = "Results", cell_min_w: int = 24, cell_h: int = 4,
+                 empty_text: str = "Waiting for results..."):
+        self.items = items
+        self.render_cell = render_cell
+        self.title = title
+        self.cell_min_w = cell_min_w
+        self.cell_h = cell_h
+        self.empty_text = empty_text
+
+    def _cell(self, item) -> Panel:
+        text = self.render_cell(item)
+        text.no_wrap = True
+        text.overflow = "ellipsis"
+        return Panel(text, height=self.cell_h, padding=(0, 1), border_style="chrome.border")
+
+    def __rich_console__(self, console, options):
+        width = options.max_width
+        height = options.height or options.max_height or console.height
+        cols = max(1, max(1, width - 2) // self.cell_min_w)
+        rows = max(1, max(1, height - 2) // self.cell_h)
+        shown = list(self.items)[-(cols * rows):]
+
+        if not shown:
+            body = Text(self.empty_text, style="chrome")
+        else:
+            body = Table.grid(expand=True)
+            for _ in range(cols):
+                body.add_column(ratio=1, no_wrap=True)
+            for i in range(0, len(shown), cols):
+                cells = [self._cell(r) for r in shown[i:i + cols]]
+                cells += [Text("")] * (cols - len(cells))
+                body.add_row(*cells)
+
+        yield Panel(body, title=f"{self.title} ({len(shown)} of {len(self.items)})",
+                    height=height, padding=(0, 0))
 
 
 def _fmt_context(tokens) -> str:

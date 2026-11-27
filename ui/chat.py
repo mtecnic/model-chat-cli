@@ -65,6 +65,8 @@ class ChatView:
                         return "arena"
                     elif command_result == "prompt_arena":
                         return "prompt_arena"
+                    elif command_result == "bench":
+                        return "bench"
                     continue
 
                 # Add user message to history
@@ -293,6 +295,9 @@ class ChatView:
         elif cmd == "/promptarena":
             return "prompt_arena"
 
+        elif cmd == "/bench":
+            return "bench"
+
         elif cmd == "/history":
             await self._handle_history()
 
@@ -314,6 +319,7 @@ class ChatView:
             self.console.print("  [accent]/system[/accent]       System prompt")
             self.console.print("  [accent]/think[/accent]        Toggle reasoning mode")
             self.console.print("  [accent]/stress[/accent]       Stress test")
+            self.console.print("  [accent]/bench[/accent]        Accuracy benchmarks (GSM8K, MMLU-Pro, ARC, HumanEval)")
             self.console.print("  [accent]/arena[/accent]        Multi-model arena (side by side)")
             self.console.print("  [accent]/promptarena[/accent]  Prompt comparison tournament")
             self.console.print()

@@ -12,6 +12,7 @@ from ui.chat import ChatView
 from ui.stress_test import StressTestView
 from ui.arena import ArenaView
 from ui.multi_arena import MultiArenaView
+from ui.bench import BenchView
 from ui.interrupt import install_default_sigint
 
 
@@ -22,6 +23,7 @@ class AppState(Enum):
     STRESS_TEST = "stress_test"
     PROMPT_ARENA = "prompt_arena"
     ARENA = "arena"
+    BENCH = "bench"
     QUIT = "quit"
 
 
@@ -52,6 +54,8 @@ class ModelChatCLI:
                     await self._prompt_arena_mode()
                 elif self.state == AppState.ARENA:
                     await self._arena_mode()
+                elif self.state == AppState.BENCH:
+                    await self._bench_mode()
 
         except (KeyboardInterrupt, EOFError):
             self.console.print("\n[chrome]Goodbye![/chrome]")
@@ -91,6 +95,8 @@ class ModelChatCLI:
                 self.state = AppState.PROMPT_ARENA
             elif result == "arena":
                 self.state = AppState.ARENA
+            elif result == "bench":
+                self.state = AppState.BENCH
             else:
                 self.state = AppState.QUIT
 
@@ -142,6 +148,17 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at a menu prompt; running operations handle their own cancel
+            self.state = AppState.CHAT
+
+    async def _bench_mode(self):
+        """Handle benchmark mode - accuracy evals (GSM8K, MMLU-Pro, ...)."""
+        bench = BenchView(self.console, self.selected_server, self.selected_model)
+
+        try:
+            result = await bench.run()
+            self.state = AppState.CHAT if result == "back" else AppState.QUIT
         except (KeyboardInterrupt, EOFError):
             # Ctrl+C at a menu prompt; running operations handle their own cancel
             self.state = AppState.CHAT

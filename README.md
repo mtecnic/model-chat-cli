@@ -41,7 +41,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-That's it. The app scans your subnet, finds every model server, and drops you into a model picker. Pick one and start chatting — or type `/stress` for benchmarking, `/arena` for head-to-head battles.
+That's it. The app scans your subnet, finds every model server, and drops you into a model picker. Pick one and start chatting — or type `/bench` for accuracy benchmarks, `/stress` for load testing, `/arena` for head-to-head battles.
 
 ---
 
@@ -55,6 +55,7 @@ That's it. The app scans your subnet, finds every model server, and drops you in
 │  ▶  Prompt Arena     │  System-prompt comparison with self-judging                 │
 │  ▶  Stress Testing   │  6 modes incl. realistic-user (Poisson) and tool bench      │
 │  ▶  Tool Bench       │  45 agentic tasks across 6 difficulty tiers                 │
+│  ▶  Benchmarks       │  GSM8K · MMLU-Pro · ARC-Challenge · HumanEval accuracy      │
 └──────────────────────┴─────────────────────────────────────────────────────────────┘
 ```
 
@@ -114,6 +115,7 @@ With `/think` enabled, reasoning content renders in italics and the stats line b
 | `/arena`        | Multi-model arena                   |
 | `/promptarena`  | System-prompt tournament            |
 | `/stress`       | Stress testing                      |
+| `/bench`        | Accuracy benchmarks                 |
 | `/help`         | Show all commands                   |
 
 ---
@@ -179,6 +181,28 @@ Six modes covering throughput, stability, realistic traffic, and agentic capabil
 | 6 | **Tool Bench**   | Agentic tool-calling benchmark — see below |
 
 Live dashboard streams per-request status, error log, percentile latencies, variance / drift, and a final summary panel.
+
+---
+
+## Accuracy Benchmarks (`/bench`)
+
+Standard question sets with automatic grading, so scores are comparable to published numbers (allowing for prompt-format differences):
+
+| Benchmark | Questions | Graded by |
+|-----------|-----------|-----------|
+| **GSM8K** | 1,319 grade-school math problems | Exact numeric match on the final answer (`#### n`) |
+| **MMLU-Pro** | 12,032 hard 10-option multiple-choice, 14 subjects | Letter extracted from "The answer is (X)" (zero-shot CoT) |
+| **ARC-Challenge** | 1,172 hard science multiple-choice | Letter match |
+| **HumanEval** | 164 Python functions | pass@1: the model's code is run against the unit tests |
+
+- Datasets download from Hugging Face on first use (no extra dependencies) and are cached in `~/.model_chat_bench/data/`.
+- Pick a sample size (25 – 500 or all). The sample is seeded, so repeated runs ask the same questions. Results show accuracy with a 95% confidence interval, so small samples are not over-read.
+- Concurrency (1 – 16) and thinking on/off are configurable. With thinking on, the token budget is 4× larger.
+- Every run is saved to `~/.model_chat_bench/results/`. The summary compares the result with your previous runs of the same model.
+- Errors and replies cut off by the token limit are counted and shown separately; both score as wrong.
+- Ctrl+C stops a run and scores only the questions that finished.
+
+> **HumanEval runs model-generated code on your machine.** It runs in a separate process with CPU, memory and time limits in an empty temp directory, but it is not a security sandbox. The app asks before running it.
 
 ---
 
@@ -312,6 +336,7 @@ graph TB
         ST[stress_tester.py — 6-mode load testing]
         TB[tool_bench.py — agent loop + 45 tasks]
         PA[prompt_arena.py — prompt comparison]
+        BM[benchmarks/ — accuracy evals]
     end
     subgraph "UI Layer"
         UI[ui/ — Rich-based dashboards & chat]
@@ -326,6 +351,8 @@ graph TB
     ST --> C
     TB --> C
     PA --> C
+    UI --> BM
+    BM --> C
 
     style M fill:#1a1a2e,color:#eee,stroke:#0f3460
     style C fill:#16213e,color:#eee,stroke:#0f3460
@@ -344,6 +371,8 @@ model-chat-cli/
 ├── tool_bench.py        · Agentic tool-calling benchmark — mock tools,
 │                          executors, agent loop, 6-tier task suite, scoring
 ├── think_parser.py      · <think>...</think> stream parser
+├── benchmarks/          · Accuracy evals: dataset download/cache, runner,
+│                          GSM8K / MMLU-Pro / ARC / HumanEval graders, sandbox
 ├── logger.py            · Centralized logging
 ├── storage/
 │   └── history.py       · Chat history persistence
@@ -354,7 +383,8 @@ model-chat-cli/
     ├── chat.py          · Streaming chat with TTFT / decode TPS
     ├── multi_arena.py   · Multi-model arena (battle / tournament / blind)
     ├── arena.py         · Prompt comparison UI
-    └── stress_test.py   · Stress test dashboard + tool-bench summary
+    ├── stress_test.py   · Stress test dashboard + tool-bench summary
+    └── bench.py         · Accuracy benchmark dashboard + results
 ```
 
 ---
