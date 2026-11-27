@@ -107,7 +107,8 @@ With `/think` enabled, reasoning content renders in italics and the stats line b
 | `/quit`, `/q`   | Exit                                |
 | `/switch`       | Back to model picker                |
 | `/clear`        | Clear conversation history          |
-| `/export`       | Export to markdown                  |
+| `/export`       | Export to markdown (+ save to history) |
+| `/history`      | Load a saved conversation           |
 | `/system`       | View / edit system prompt           |
 | `/think`        | Toggle reasoning mode               |
 | `/arena`        | Multi-model arena                   |
@@ -160,7 +161,7 @@ Pit different system prompts against each other on the same model to find which 
    concise       · Maximum brevity without losing accuracy
 ```
 
-Round-robin tournament: every prompt competes head-to-head, judged by the same model that generated.
+Round-robin tournament: every prompt competes head-to-head. The judge is the same model by default, or any other discovered model. Judging is blind (the judge never sees prompt names) and every pair is judged in both orders; if the verdict flips when the order is swapped, it counts as a tie.
 
 ---
 
@@ -362,8 +363,17 @@ model-chat-cli/
 
 | Key       | Action                          |
 |-----------|---------------------------------|
+| `Ctrl+C`  | Stop the running generation / test / scan; at the chat prompt, opens a quit / model-picker menu |
 | `Ctrl+D`  | Back to model selection         |
-| `Ctrl+C`  | Quit (with confirmation prompt) |
+
+A stopped stress test still prints a summary of the requests that finished.
+
+## Environment Variables
+
+| Variable           | Effect |
+|--------------------|--------|
+| `MODEL_CHAT_HOSTS` | Extra hosts to probe during scans, comma or space separated (for servers outside your /24 subnet) |
+| `MODEL_CHAT_DEBUG` | Also print log messages to the terminal (normally they only go to `logs/`) |
 
 ---
 
@@ -371,7 +381,7 @@ model-chat-cli/
 
 - **Python** 3.10 +
 - **Terminal** with 256-color support (recommended: a true-color terminal)
-- **Dependencies:** `rich`, `httpx`, `asyncio-throttle`, `prompt-toolkit`
+- **Dependencies:** `rich`, `httpx`, `prompt-toolkit`
 
 ---
 

@@ -18,6 +18,7 @@ from rich.prompt import Prompt, IntPrompt
 from client import ModelClient
 from scanner import load_cache
 from ui.components import format_stats_line, format_menu_item, estimate_tokens, _model_label
+from ui.interrupt import run_interruptible
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -157,6 +158,7 @@ class MultiArenaView:
         self.model_keys: List[str] = []
         self.system_prompt: str = ""
         self.blind_mode: bool = False
+        self.last_interrupted: bool = False  # set by _stream_all on Ctrl+C
         self.blind_labels: List[str] = []   # shuffled display labels
         self.blind_order: List[int] = []    # shuffled index order
 
@@ -176,8 +178,7 @@ class MultiArenaView:
         if len(choices) < 2:
             self.console.print("  [status.warn]Need at least 2 models for the arena.[/status.warn]")
             self.console.print("  [chrome]Found {} model(s). Run discovery first.[/chrome]".format(len(choices)))
-            self.console.print("\n  [chrome]Press Enter to return...[/chrome]")
-            input()
+            self._wait_for_enter("Press Enter to return")
             return "back"
 
         # 2. Model selection
@@ -210,9 +211,14 @@ class MultiArenaView:
         # 6. Offer export
         self._offer_export()
 
-        self.console.print("\n  [chrome]Press Enter to return to chat...[/chrome]")
-        input()
+        self._wait_for_enter("Press Enter to return to chat")
         return "back"
+
+    def _wait_for_enter(self, message: str):
+        try:
+            Prompt.ask(f"\n  [chrome]{message}[/chrome]", default="", show_default=False)
+        except (KeyboardInterrupt, EOFError):
+            pass
 
     # ── Model selection ──────────────────────────────────────────────────────
 
@@ -481,46 +487,59 @@ class MultiArenaView:
         self.console.print(f"\n  [status.info]Running {total_rounds} rounds ({len(prompts)} prompts x {repeats} repeats)...[/status.info]\n")
 
         round_num = 0
+        stop = False
         for prompt in prompts:
+            if stop:
+                break
             for rep in range(repeats):
+                if stop:
+                    break
                 round_num += 1
                 self.console.print(f"  [chrome.header]Round {round_num}/{total_rounds}[/chrome.header]")
                 preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
                 self.console.print(f"  [chrome]{preview}[/chrome]\n")
 
                 responses = await self._stream_all(prompt)
+                if self.last_interrupted:
+                    self.console.print("  [chrome]Tournament stopped.[/chrome]")
+                    stop = True
+                    break
                 rr = RoundResult(round_num=round_num, prompt=prompt, responses=responses)
 
                 # Auto-judge with suite-specific criteria
                 criteria = prompt_criteria_map.get(prompt, DEFAULT_CRITERIA)
-                judge_result = await self._auto_judge(judge_client, prompt, responses, criteria)
-                if judge_result:
-                    rr.judge_scores = judge_result.get("scores", {})
-                    rr.judge_winner = judge_result.get("winner", "")
-                    rr.judge_explanation = judge_result.get("explanation", "")
-
-                    # Map letter winner back to model key
-                    winner_letter = rr.judge_winner
-                    letters = [chr(65 + i) for i in range(len(responses))]
-                    if winner_letter in letters:
-                        winner_idx = letters.index(winner_letter)
-                        key = self.model_keys[winner_idx]
+                judge_result, interrupted = await run_interruptible(
+                    self._auto_judge(judge_client, prompt, responses, criteria))
+                if interrupted:
+                    self.console.print("  [chrome]Tournament stopped.[/chrome]")
+                    stop = True
+                    break
+                elif judge_result:
+                    rr.judge_scores = {self.model_keys[i]: v for i, v in judge_result["scores"].items()}
+                    rr.judge_explanation = judge_result["explanation"]
+                    widx = judge_result["winner_idx"]
+                    if widx is not None:
+                        key = self.model_keys[widx]
+                        rr.winner = key
+                        rr.judge_winner = key
                         self.scores[key] = self.scores.get(key, 0) + 1
-
-                    # Apply score points
-                    for letter, score in rr.judge_scores.items():
-                        if letter in letters:
-                            idx = letters.index(letter)
-                            # Track as fractional score points too
-                            pass
-
-                    self.console.print(f"  [metric]Winner: {rr.judge_winner}[/metric] — {rr.judge_explanation}")
+                        self.console.print(Text.assemble(
+                            ("  Winner: ", "metric"), (self._get_display_label(widx), "metric"),
+                            f" — {rr.judge_explanation}"))
+                    else:
+                        self.console.print("  [status.warn]Judge didn't name a valid winner.[/status.warn]")
+                    if judge_result["truncated"]:
+                        names = ", ".join(self._get_display_label(i) for i in judge_result["truncated"])
+                        self.console.print(
+                            f"  [chrome](truncated for judge at {self.JUDGE_CHAR_LIMIT} chars: {names})[/chrome]")
                 else:
                     self.console.print("  [status.warn]Judge failed to return valid scores.[/status.warn]")
 
                 self.rounds.append(rr)
                 self.console.print()
 
+        if not self.rounds:
+            return
         if self.blind_mode:
             self._reveal_identities()
         self._show_final_results()
@@ -600,23 +619,48 @@ class MultiArenaView:
         self.console.print("\n  [chrome]Enter prompts (one per line, empty to finish):[/chrome]\n")
         prompts = []
         while True:
-            q = input(f"  P{len(prompts) + 1}: ").strip()
+            q = Prompt.ask(f"  [prompt]P{len(prompts) + 1}[/prompt]", default="",
+                           show_default=False).strip()
             if not q:
                 break
             prompts.append(q)
         return prompts
 
+    # Max characters of each response shown to the judge. Longer responses
+    # are cut with a visible [truncated] marker (and reported to the user).
+    JUDGE_CHAR_LIMIT = 6000
+
     async def _auto_judge(self, judge_client: ModelClient, prompt: str,
                           responses: List[ArenaResponse],
                           criteria: Optional[List[str]] = None) -> Optional[Dict]:
-        """Have the judge model score all responses using suite-specific criteria."""
-        n = len(responses)
-        letters = [chr(65 + i) for i in range(n)]
+        """Have the judge model score the valid responses.
 
+        Errored/empty responses are not shown to the judge. The order the
+        judge sees is shuffled each round to counter position bias.
+
+        Returns {"winner_idx": int|None, "scores": {idx: score},
+        "explanation": str, "truncated": [idx]} with indices into `responses`,
+        or None if the judge failed.
+        """
+        candidates = [i for i, r in enumerate(responses) if r.text.strip() and not r.error]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return {"winner_idx": candidates[0], "scores": {},
+                    "explanation": "Only one model returned a valid response.", "truncated": []}
+
+        order = candidates[:]
+        random.shuffle(order)
+        letters = [chr(65 + i) for i in range(len(order))]
+
+        truncated = []
         response_text = ""
-        for i, resp in enumerate(responses):
-            text = resp.text[:2000] if resp.text else "(error or empty)"
-            response_text += f"\nResponse {letters[i]}:\n{text}\n"
+        for letter, idx in zip(letters, order):
+            text = responses[idx].text
+            if len(text) > self.JUDGE_CHAR_LIMIT:
+                text = text[:self.JUDGE_CHAR_LIMIT] + "\n[truncated]"
+                truncated.append(idx)
+            response_text += f"\nResponse {letter}:\n{text}\n"
 
         score_keys = ", ".join(f'"{l}": <1-10>' for l in letters)
         judge_prompt = f"""Question: {prompt}
@@ -632,12 +676,28 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
             result = strip_thinking(result)
             start = result.find("{")
             end = result.rfind("}") + 1
-            if start >= 0 and end > start:
-                return json.loads(result[start:end])
+            if start < 0 or end <= start:
+                return None
+            data = json.loads(result[start:end])
         except Exception as e:
-            self.console.print(f"  [status.error]Judge error: {e}[/status.error]")
+            self.console.print(Text(f"  Judge error: {e}", style="status.error"))
+            return None
 
-        return None
+        winner = str(data.get("winner", "")).strip().upper()
+        scores = {}
+        for letter, score in (data.get("scores") or {}).items():
+            letter = str(letter).strip().upper()
+            if letter in letters:
+                try:
+                    scores[order[letters.index(letter)]] = float(score)
+                except (TypeError, ValueError):
+                    pass
+        return {
+            "winner_idx": order[letters.index(winner)] if winner in letters else None,
+            "scores": scores,
+            "explanation": str(data.get("explanation", "")),
+            "truncated": truncated,
+        }
 
     # ── Streaming core ───────────────────────────────────────────────────────
 
@@ -656,7 +716,8 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
         rows_count = (n + cols - 1) // cols
 
         term_height = self.console.size.height
-        cell_height = max(6, (term_height - 4) // rows_count - 3)
+        # Live runs on the alternate screen, so the rows can use the whole height
+        cell_height = max(5, term_height // rows_count)
 
         layout = self._build_grid_layout(n, cols, rows_count, cell_height)
 
@@ -690,9 +751,10 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
 
         tasks = [asyncio.create_task(stream_one(i)) for i in range(n)]
 
-        # Display loop
-        try:
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
+        # Display loop — alternate screen so the full-height grid can't scroll;
+        # full responses are printed to the normal screen afterwards.
+        async def display():
+            with Live(layout, console=self.console, screen=True, refresh_per_second=4):
                 while not all(e.is_set() for e in done_events):
                     await asyncio.sleep(0.25)
                     self._update_grid(layout, n, buffers, done_events, errors,
@@ -701,10 +763,12 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
                 self._update_grid(layout, n, buffers, done_events, errors,
                                   display_labels, cell_height)
 
-        except KeyboardInterrupt:
+        _, interrupted = await run_interruptible(display())
+        self.last_interrupted = interrupted
+        if interrupted:
             for t in tasks:
                 t.cancel()
-            self.console.print("\n  [chrome](cancelled)[/chrome]")
+            self.console.print("\n  [chrome](cancelled — partial responses kept)[/chrome]")
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -761,8 +825,8 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
                 if cell_idx < n:
                     cell = Layout(name=f"cell{cell_idx}")
                     cell.update(Panel(
-                        "[chrome]waiting...[/chrome]",
-                        title=f"[accent]{display_labels[cell_idx]}[/accent]",
+                        Text("waiting...", style="chrome"),
+                        title=Text(display_labels[cell_idx], style="accent"),
                         border_style="chrome.border",
                         height=cell_height,
                     ))
@@ -782,31 +846,41 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
                      buffers: List[List[str]], done_events: List[asyncio.Event],
                      errors: List[str], display_labels: List[str],
                      cell_height: int):
-        """Update all grid cells with current buffer tails."""
-        max_lines = cell_height - 3
+        """Update all grid cells with the newest lines of each response.
+
+        Text is wrapped at the real cell width and the tail is shown, so long
+        unbroken output scrolls instead of being cut off. Model output is
+        rendered as plain Text, never as markup.
+        """
+        cols = min(n, 3) if n > 2 else n
+        inner_width = max(10, self.console.width // max(cols, 1) - 4)
+        max_lines = max(1, cell_height - 2)
 
         for i in range(n):
             raw = "".join(buffers[i])
             # Cheap tag removal for display — avoids regex on full buffer every refresh
             text = raw.replace("<think>", "").replace("</think>", "")
-            lines = text.split('\n')
 
             if errors[i]:
-                visible = f"[status.error]{errors[i][:100]}[/status.error]"
-                border = "status.error"
-            elif done_events[i].is_set():
-                visible = '\n'.join(lines[-max_lines:]) if len(lines) > max_lines else text
-                border = "status.ok"
+                visible = Text(errors[i][:300], style="status.error")
+                border, icon = "status.error", "\u2717"
             elif text:
-                visible = '\n'.join(lines[-max_lines:]) if len(lines) > max_lines else text
-                border = "status.running"
+                # Only wrap the recent part; enough to fill the cell
+                recent = text[-(inner_width * max_lines * 2):]
+                wrapped = Text(recent).wrap(self.console, inner_width)
+                visible = Text("\n").join(list(wrapped)[-max_lines:])
+                done = done_events[i].is_set()
+                border = "status.ok" if done else "status.running"
+                icon = "\u2713" if done else "\u25cf"
+            elif done_events[i].is_set():
+                visible = Text("(empty response)", style="status.warn")
+                border, icon = "status.warn", "\u2717"
             else:
-                visible = "[chrome]waiting...[/chrome]"
-                border = "chrome.border"
+                visible = Text("waiting...", style="chrome")
+                border, icon = "chrome.border", "\u25cf"
 
-            status_icon = "\u2713" if done_events[i].is_set() else "\u23f3"
-            title = f"[accent]{display_labels[i]}[/accent] {status_icon}"
-
+            # Icon first so it survives title truncation in narrow cells
+            title = Text.assemble(f"{icon} ", (display_labels[i], "accent"))
             layout[f"cell{i}"].update(Panel(
                 visible, title=title, border_style=border, height=cell_height,
             ))
@@ -826,10 +900,11 @@ Score each response 1-10 and pick a winner. Reply with ONLY this JSON:
             self.console.print(label)
 
             if resp.error:
-                self.console.print(f"  [status.error]Error: {resp.error}[/status.error]")
+                self.console.print(Text(f"  Error: {resp.error}", style="status.error"))
             elif resp.text:
+                # Model output is plain text, never Rich markup
                 for line in resp.text.split('\n'):
-                    self.console.print(f"  {line}")
+                    self.console.print(Text(f"  {line}"))
                 # Stats line with TTFT
                 stats = Text()
                 stats.append("  \u21b3 ", style="chrome")

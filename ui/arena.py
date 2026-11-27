@@ -21,6 +21,7 @@ from prompt_arena import (
     TEST_QUESTIONS,
 )
 from ui.components import format_menu_item
+from ui.interrupt import run_interruptible
 
 
 class ArenaView:
@@ -56,10 +57,36 @@ class ArenaView:
         elif mode == 3:
             await self._run_custom_prompt_mode()
 
-        self.console.print("\n  [chrome]Press Enter to return to chat...[/chrome]")
-        input()
+        try:
+            Prompt.ask("\n  [chrome]Press Enter to return to chat[/chrome]",
+                       default="", show_default=False)
+        except (KeyboardInterrupt, EOFError):
+            pass
 
         return "back"
+
+    def _choose_judge(self) -> bool:
+        """Pick the judge model. Returns False if the user backed out."""
+        self.console.print("  [chrome.header]Judge[/chrome.header]\n")
+        self.console.print(format_menu_item("1", "Self-judge", f"{self.model} judges its own answers"))
+        self.console.print(format_menu_item("2", "Another model", "Pick a different model as an impartial judge"))
+        self.console.print()
+        try:
+            choice = Prompt.ask("[prompt]Judge[/prompt]", choices=["1", "2"], default="1")
+        except (KeyboardInterrupt, EOFError):
+            return False
+        if choice == "2":
+            # Reuse the multi-arena's model list (current + cached servers) and picker
+            from ui.multi_arena import MultiArenaView
+            picker = MultiArenaView(self.console, self.server, self.model)
+            server, model = picker._select_judge(picker._build_model_list())
+            if server is None:
+                return False
+            self.arena.set_judge(server, model)
+        else:
+            self.arena.set_judge(self.server, self.model)
+        self.console.print(f"  [status.ok]Judge: {self.arena.judge_label}[/status.ok]\n")
+        return True
 
     def _select_mode(self) -> Optional[int]:
         """Show mode selection menu."""
@@ -94,6 +121,8 @@ class ArenaView:
         question = self._get_user_question()
         if not question:
             return
+        if not self._choose_judge():
+            return
 
         self.current_responses = []
         self.current_matchups = []
@@ -102,32 +131,37 @@ class ArenaView:
         layout = self._create_layout(f"Tournament | {len(prompts)} prompts")
 
         try:
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(item):
-                    if isinstance(item, PromptResponse):
-                        existing = next(
-                            (r for r in self.current_responses if r.prompt_key == item.prompt_key),
-                            None
-                        )
-                        if existing:
-                            idx = self.current_responses.index(existing)
-                            self.current_responses[idx] = item
-                        else:
-                            self.current_responses.append(item)
-                        self.phase = "generating"
-                    elif isinstance(item, ArenaMatchup):
-                        self.current_matchups.append(item)
-                        self.phase = "judging"
+            async def update_callback(item):
+                if isinstance(item, PromptResponse):
+                    existing = next(
+                        (r for r in self.current_responses if r.prompt_key == item.prompt_key),
+                        None
+                    )
+                    if existing:
+                        idx = self.current_responses.index(existing)
+                        self.current_responses[idx] = item
+                    else:
+                        self.current_responses.append(item)
+                    self.phase = "generating"
+                elif isinstance(item, ArenaMatchup):
+                    self.current_matchups.append(item)
+                    self.phase = "judging"
 
-                    self._update_layout(layout, question)
+                self._update_layout(layout, question)
 
-                result = await self.arena.run_tournament(question, update_callback)
+            # Alternate screen: the full-height layout can't scroll the terminal
+            with Live(layout, console=self.console, screen=True, refresh_per_second=4):
+                result, interrupted = await run_interruptible(
+                    self.arena.run_tournament(question, update_callback))
 
+            if interrupted:
+                self.console.print("\n  [status.warn]Tournament stopped.[/status.warn]")
+                return
             self._show_tournament_results(result)
 
         except Exception as e:
-            self.console.print(f"\n  [status.error]Tournament failed: {type(e).__name__} - {str(e)}[/status.error]")
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
+            self.console.print(Text(f"\n  Tournament failed: {type(e).__name__} - {e}", style="status.error"))
+            self.console.print(Text(traceback.format_exc(), style="chrome"))
 
     async def _run_multi_round_mode(self):
         """Run multi-round battle mode."""
@@ -137,24 +171,33 @@ class ArenaView:
         questions = self._select_questions()
         if not questions:
             return
+        if not self._choose_judge():
+            return
 
         self.console.print(f"\n  [status.info]Running {len(questions)} rounds...[/status.info]\n")
 
         try:
             layout = self._create_multi_round_layout(f"Battle | {len(questions)} rounds")
 
-            with Live(layout, console=self.console, refresh_per_second=2) as live:
-                async def update_callback(item):
-                    if isinstance(item, ArenaStats):
-                        self._update_multi_round_layout(layout, item)
+            async def update_callback(item):
+                if isinstance(item, ArenaStats):
+                    self._update_multi_round_layout(layout, item)
 
-                stats = await self.arena.run_multi_round(questions, update_callback)
+            with Live(layout, console=self.console, screen=True, refresh_per_second=2):
+                stats, interrupted = await run_interruptible(
+                    self.arena.run_multi_round(questions, update_callback))
 
+            if interrupted:
+                stats = self.arena.stats
+                self.console.print(f"\n  [status.warn]Stopped after {stats.completed_rounds} "
+                                   f"completed round(s).[/status.warn]")
+                if not stats.completed_rounds:
+                    return
             self._show_multi_round_summary(stats)
 
         except Exception as e:
-            self.console.print(f"\n  [status.error]Battle failed: {type(e).__name__} - {str(e)}[/status.error]")
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
+            self.console.print(Text(f"\n  Battle failed: {type(e).__name__} - {e}", style="status.error"))
+            self.console.print(Text(traceback.format_exc(), style="chrome"))
 
     async def _run_custom_prompt_mode(self):
         """Run custom prompt management."""
@@ -478,8 +521,14 @@ class ArenaView:
         if result.winner:
             winner_info = self.arena.prompts.get(result.winner, {"name": result.winner})
             self.console.print(Panel(
-                f"[metric]Winner: {winner_info['name']}[/metric]",
+                Text(f"Winner: {winner_info['name']}", style="metric"),
                 border_style="metric"
+            ))
+            self.console.print()
+        elif result.rankings:
+            self.console.print(Panel(
+                Text("No clear winner — the top prompts tied.", style="status.warn"),
+                border_style="status.warn"
             ))
             self.console.print()
 
@@ -522,22 +571,30 @@ class ArenaView:
                     a = matchup.response_a.prompt_name
                     b = matchup.response_b.prompt_name
 
+                    # Names and explanations come from users/models: Text, not markup
                     if jr.winner == "A":
-                        self.console.print(f"  [status.ok]{a}[/status.ok] > {b}: {jr.explanation}")
+                        line = Text.assemble("  ", (a, "status.ok"), f" > {b}: ")
                     elif jr.winner == "B":
-                        self.console.print(f"  {a} < [status.ok]{b}[/status.ok]: {jr.explanation}")
+                        line = Text.assemble(f"  {a} < ", (b, "status.ok"), ": ")
                     else:
-                        self.console.print(f"  [status.warn]{a} = {b}[/status.warn]: {jr.explanation}")
+                        line = Text.assemble("  ", (f"{a} = {b}", "status.warn"), ": ")
+                    line.append(jr.explanation)
+                    self.console.print(line)
 
     def _show_multi_round_summary(self, stats: ArenaStats):
         """Display multi-round battle summary."""
         self.console.print("\n  [status.ok]Battle Complete[/status.ok]\n")
 
-        if stats.prompt_wins:
-            winner_key = max(
-                stats.prompt_wins.keys(),
-                key=lambda k: (stats.prompt_wins[k], stats.get_avg_score(k))
-            )
+        rank_key = lambda k: (stats.prompt_wins[k], stats.get_avg_score(k))
+        top = max(stats.prompt_wins.keys(), key=rank_key) if stats.prompt_wins else None
+        if top is not None and sum(1 for k in stats.prompt_wins if rank_key(k) == rank_key(top)) > 1:
+            self.console.print(Panel(
+                Text("No clear champion — the top prompts tied.", style="status.warn"),
+                border_style="status.warn"
+            ))
+            self.console.print()
+        elif top is not None:
+            winner_key = top
             winner_info = self.arena.prompts.get(winner_key, {"name": winner_key})
 
             self.console.print(Panel(

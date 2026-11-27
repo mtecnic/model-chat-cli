@@ -1,4 +1,6 @@
 """Reusable Rich components for the Model Chat CLI."""
+from typing import Optional
+
 from rich.table import Table
 from rich.text import Text
 
@@ -24,29 +26,34 @@ def _model_label(model) -> str:
     return model
 
 
-def create_model_table(servers: list) -> Table:
+def create_model_table(servers: list, width: Optional[int] = None) -> Table:
     """Create a table displaying discovered models.
 
     Args:
         servers: List of server dictionaries with models
+        width: Terminal width; caps the Model column so the others keep their size
 
     Returns:
         Rich Table with all discovered models
 
-    The Model and Server columns shrink first when the terminal is narrow:
-    the server column is right-aligned with overflow="fold", so the last
-    characters of the address (the host's last octet and the port) stay
-    visible when the row can't fit fully.
+    Every column except Model has a fixed width, so only the model name
+    shrinks (with an ellipsis) on a narrow terminal. (Column `ratio`s would
+    squeeze the small columns to nothing instead.)
     """
+    fixed = {"#": 3, "Server": 21, "Ctx": 5, "Type": 7, "": 1, "Latency": 8}
+    # 7 columns x 2 padding + 8 border characters
+    chrome_width = sum(fixed.values()) + 7 * 2 + 8
+    model_max = max(12, width - chrome_width) if width else None
+
     table = Table(title="[accent.bold]Discovered Models[/accent.bold]", show_header=True)
-    table.add_column("#", style="chrome", width=3, justify="right")
-    table.add_column("Model", style="model.name", no_wrap=True, overflow="fold", min_width=10, ratio=3)
-    table.add_column("Server", style="model.server", no_wrap=True, overflow="fold",
-                     justify="right", min_width=18, ratio=2)
-    table.add_column("Ctx", style="chrome", justify="right", no_wrap=True)
-    table.add_column("Type", style="chrome", justify="center", no_wrap=True)
-    table.add_column("Status", justify="center", width=1)
-    table.add_column("Latency", justify="right", width=7)
+    table.add_column("#", style="chrome", width=3, justify="right", no_wrap=True)
+    table.add_column("Model", style="model.name", no_wrap=True, overflow="ellipsis",
+                     min_width=12, max_width=model_max)
+    table.add_column("Server", style="model.server", no_wrap=True, justify="right", width=21)
+    table.add_column("Ctx", style="chrome", justify="right", no_wrap=True, width=5)
+    table.add_column("Type", style="chrome", justify="center", no_wrap=True, width=7)
+    table.add_column("", justify="center", no_wrap=True, width=1)
+    table.add_column("Latency", justify="right", no_wrap=True, width=8)
 
     idx = 1
     for server in servers:
@@ -59,7 +66,7 @@ def create_model_table(servers: list) -> Table:
             }.get(status, "\u2022")
 
             response_time = server.get("response_time", 0)
-            latency = f"{response_time}ms" if response_time else "N/A"
+            latency = f"{response_time:.0f}ms" if response_time else "-"
 
             server_addr = f"{server['ip']}:{server['port']}"
             server_type = server['type'].upper()

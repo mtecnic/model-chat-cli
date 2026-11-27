@@ -23,16 +23,30 @@ HTTP_TIMEOUT = 2.0     # Seconds for endpoint checks on live servers
 PRESCAN_CONCURRENCY = 500
 
 
-def _detect_local_ip() -> str:
-    """Get this host's local IPv4 address via a UDP connect to public DNS."""
+def _detect_local_ip() -> Optional[str]:
+    """Get this host's local IPv4 address via a UDP connect to public DNS.
+
+    No packet is sent; this only asks the OS which interface would route
+    there. Returns None when there is no usable route (e.g. offline).
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if local_ip and not local_ip.startswith("127."):
+            return local_ip
     except Exception:
-        return "192.168.1.1"
+        pass
+    return None
+
+
+def env_extra_hosts() -> List[str]:
+    """Hosts from MODEL_CHAT_HOSTS (comma/space separated) to always probe."""
+    raw = os.environ.get("MODEL_CHAT_HOSTS", "")
+    return [h.strip() for h in raw.replace(",", " ").split() if h.strip()]
 
 
 async def tcp_probe(ip: str, port: int, semaphore: asyncio.Semaphore,
@@ -64,6 +78,50 @@ async def check_endpoint(client: httpx.AsyncClient, url: str, endpoint: str) -> 
     return None
 
 
+def parse_models(server_type: str, data: Dict) -> List[Dict]:
+    """Turn a /v1/models or /api/tags response into [{name, max_context}]."""
+    if not isinstance(data, dict):
+        return []
+    if server_type == "openai":
+        return [
+            {
+                "name": m.get("id", "unknown"),
+                # vLLM/OpenAI-compatible servers report this per model;
+                # llama.cpp exposes meta.n_ctx; fall back to server-level field
+                "max_context": (m.get("max_model_len")
+                                or (m.get("meta") or {}).get("n_ctx")
+                                or data.get("max_model_len")),
+            }
+            for m in data.get("data", []) if isinstance(m, dict)
+        ]
+    return [
+        # /api/tags has no context length; fill_ollama_context() adds it
+        {"name": m.get("name", "unknown"), "max_context": None}
+        for m in data.get("models", []) if isinstance(m, dict)
+    ]
+
+
+async def fill_ollama_context(client: httpx.AsyncClient, base_url: str,
+                              models: List[Dict]) -> None:
+    """Best-effort: set max_context from Ollama's /api/show model_info."""
+    async def one(model: Dict):
+        try:
+            r = await client.post(f"{base_url}/api/show",
+                                  json={"model": model["name"]}, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                return
+            info = (r.json() or {}).get("model_info") or {}
+            for key, value in info.items():
+                # e.g. "llama.context_length", "qwen3.context_length"
+                if key.endswith(".context_length") and isinstance(value, int):
+                    model["max_context"] = value
+                    return
+        except Exception:
+            pass
+
+    await asyncio.gather(*(one(m) for m in models))
+
+
 async def probe_server(ip: str, port: int, client: httpx.AsyncClient) -> Optional[Dict]:
     """Probe a single IP:port combination for AI model servers."""
     base_url = f"http://{ip}:{port}"
@@ -88,34 +146,18 @@ async def probe_server(ip: str, port: int, client: httpx.AsyncClient) -> Optiona
             "port": port,
             "url": base_url,
             "type": "openai",
-            "models": [
-                {
-                    "name": m.get("id", "unknown"),
-                    # vLLM/OpenAI-compatible servers report this per model;
-                    # llama.cpp exposes meta.n_ctx; fall back to server-level field
-                    "max_context": (m.get("max_model_len")
-                                    or (m.get("meta") or {}).get("n_ctx")
-                                    or openai_data.get("max_model_len")),
-                }
-                for m in openai_data.get("data", [])
-            ],
+            "models": parse_models("openai", openai_data),
         }
 
     if ollama_data:
+        models = parse_models("ollama", ollama_data)
+        await fill_ollama_context(client, base_url, models)
         return {
             "ip": ip,
             "port": port,
             "url": base_url,
             "type": "ollama",
-            "models": [
-                {
-                    "name": m.get("name", "unknown"),
-                    # Ollama reports context length in model_info or the Modelfile
-                    "max_context": (m.get("model_info") or {}).get("context_length")
-                    or m.get("context_length"),
-                }
-                for m in ollama_data.get("models", [])
-            ],
+            "models": models,
         }
 
     # Fallback: detect Ollama servers with no models pulled via /api/version
@@ -147,17 +189,16 @@ async def scan_network(
     Phase 1 ("tcp"): fast TCP pre-scan of all IP:port combinations.
     Phase 2 ("probe"): HTTP endpoint checks, only for live ports.
     """
-    # Get local IP to determine subnet
+    # Get local IP to determine subnet (assumes a /24; use MODEL_CHAT_HOSTS
+    # for servers outside it). If there's no route, scan only local/extra hosts.
     local_ip = _detect_local_ip()
-
-    # Extract subnet (e.g., 192.168.1.x)
-    subnet = ".".join(local_ip.split(".")[:3])
-
-    # Build the full IP list: whole subnet + always-include localhost + any extras
-    ips = [f"{subnet}.{i}" for i in range(1, 256)]
+    ips = []
+    if local_ip:
+        subnet = ".".join(local_ip.split(".")[:3])
+        ips = [f"{subnet}.{i}" for i in range(1, 256)]
     if "127.0.0.1" not in ips:
         ips.append("127.0.0.1")
-    for ip in (extra_ips or []):
+    for ip in list(extra_ips or []) + env_extra_hosts():
         if ip not in ips:
             ips.append(ip)
 
@@ -221,11 +262,24 @@ async def check_server_health(server: Dict) -> Dict:
 
             elapsed = asyncio.get_event_loop().time() - start
 
-            return {
+            refreshed = {
                 **server,
                 "status": "healthy" if response.status_code == 200 else "error",
                 "response_time": round(elapsed * 1000, 2),  # ms
             }
+            # Refresh the model list so pulled/removed models show up
+            # without a full rescan
+            if response.status_code == 200:
+                try:
+                    models = parse_models(server["type"], response.json())
+                    if server["type"] == "ollama":
+                        await fill_ollama_context(client, url, models)
+                    refreshed["models"] = models
+                    if models:
+                        refreshed.pop("note", None)
+                except ValueError:
+                    pass
+            return refreshed
     except Exception as e:
         return {
             **server,
@@ -261,20 +315,15 @@ def load_cache() -> Optional[List[Dict]]:
 async def quick_validate_cache(servers: List[Dict], progress_callback=None) -> List[Dict]:
     """Quickly validate cached servers are still available (concurrently)."""
     total = len(servers)
+    done = 0
 
-    async def validate_with_index(i: int, server: Dict):
+    async def validate(server: Dict):
+        nonlocal done
         healthy_server = await check_server_health(server)
+        done += 1  # count completions, not indexes: tasks finish out of order
         if progress_callback:
-            await progress_callback(i, total)
-        return i, healthy_server
+            await progress_callback(done, total)
+        return healthy_server
 
-    results = await asyncio.gather(
-        *(validate_with_index(i + 1, server) for i, server in enumerate(servers))
-    )
-
-    validated = []
-    for _, healthy_server in results:
-        if healthy_server.get("status") == "healthy":
-            validated.append(healthy_server)
-
-    return validated
+    results = await asyncio.gather(*(validate(server) for server in servers))
+    return [s for s in results if s.get("status") == "healthy"]

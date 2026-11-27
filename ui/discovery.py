@@ -4,7 +4,9 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Prompt
 
-from scanner import scan_network, check_server_health, load_cache, save_cache, quick_validate_cache
+from scanner import (scan_network, load_cache, save_cache, quick_validate_cache,
+                     _detect_local_ip, env_extra_hosts)
+from ui.interrupt import run_interruptible
 from ui.components import create_model_table, _model_label
 
 
@@ -33,6 +35,9 @@ class DiscoveryView:
                 self.servers = validated_servers
                 save_cache(validated_servers)
                 self._display_servers(validated_servers)
+                self.console.print(
+                    "  [chrome.muted]Showing cached servers — press [accent]R[/accent]"
+                    " to rescan the network for new ones.[/chrome.muted]")
             else:
                 self.servers = await self._scan_network()
                 if self.servers:
@@ -79,7 +84,15 @@ class DiscoveryView:
 
     async def _scan_network(self) -> list:
         """Perform full network scan with progress display."""
-        self.console.print("  [status.info]Scanning local network...[/status.info]\n")
+        if _detect_local_ip() is None:
+            self.console.print(
+                "  [status.warn]Couldn't detect a local network — scanning localhost"
+                " and MODEL_CHAT_HOSTS only.[/status.warn]")
+        elif env_extra_hosts():
+            self.console.print(
+                f"  [chrome]Also probing MODEL_CHAT_HOSTS: {', '.join(env_extra_hosts())}[/chrome]")
+        self.console.print("  [status.info]Scanning local network...[/status.info]  "
+                           "[chrome](Ctrl+C to stop)[/chrome]\n")
 
         servers = []
         with Progress(
@@ -96,10 +109,15 @@ class DiscoveryView:
             async def update_progress(current, total):
                 progress.update(task, completed=current, total=total)
 
-            servers = await scan_network(progress_callback=update_progress)
+            servers, interrupted = await run_interruptible(
+                scan_network(progress_callback=update_progress)
+            )
 
         self.console.print()
-        return servers
+        if interrupted:
+            self.console.print("  [chrome]Scan cancelled.[/chrome]")
+            return []
+        return servers or []
 
     async def _validate_cache(self, cached_servers: list) -> list:
         """Validate cached servers with progress."""
@@ -116,19 +134,21 @@ class DiscoveryView:
             async def update_progress(current, total):
                 progress.update(task, completed=current, total=total)
 
-            validated_servers = await quick_validate_cache(
-                cached_servers,
-                progress_callback=update_progress
+            validated_servers, interrupted = await run_interruptible(
+                quick_validate_cache(cached_servers, progress_callback=update_progress)
             )
 
-        return validated_servers
+        if interrupted:
+            self.console.print("  [chrome]Validation cancelled — rescanning.[/chrome]")
+            return []
+        return validated_servers or []
 
     def _display_servers(self, servers: list):
         """Display discovered servers as a table."""
         if not servers:
             return
 
-        table = create_model_table(servers)
+        table = create_model_table(servers, width=self.console.width)
         self.console.print(table)
         self.console.print()
         self.console.print("[chrome]Ctrl+C to quit[/chrome]", justify="center")

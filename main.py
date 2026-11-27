@@ -12,6 +12,7 @@ from ui.chat import ChatView
 from ui.stress_test import StressTestView
 from ui.arena import ArenaView
 from ui.multi_arena import MultiArenaView
+from ui.interrupt import install_default_sigint
 
 
 class AppState(Enum):
@@ -36,6 +37,9 @@ class ModelChatCLI:
 
     async def run(self):
         """Run the main application loop."""
+        # Ctrl+C raises KeyboardInterrupt in prompts; long async operations
+        # route it to cancellation via ui.interrupt.run_interruptible().
+        install_default_sigint()
         try:
             while self.state != AppState.QUIT:
                 if self.state == AppState.DISCOVERY:
@@ -49,7 +53,7 @@ class ModelChatCLI:
                 elif self.state == AppState.ARENA:
                     await self._arena_mode()
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             self.console.print("\n[chrome]Goodbye![/chrome]")
         except Exception as e:
             self.console.print(f"\n[status.error]An error occurred: {e}[/status.error]")
@@ -69,7 +73,7 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             self.state = AppState.QUIT
 
     async def _chat_mode(self):
@@ -90,7 +94,8 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at a prompt outside a running operation
             self.state = AppState.DISCOVERY
 
     async def _stress_test_mode(self):
@@ -105,7 +110,8 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at a menu prompt; running operations handle their own cancel
             self.state = AppState.CHAT
 
     async def _prompt_arena_mode(self):
@@ -120,7 +126,8 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at a menu prompt; running operations handle their own cancel
             self.state = AppState.CHAT
 
     async def _arena_mode(self):
@@ -135,14 +142,19 @@ class ModelChatCLI:
             else:
                 self.state = AppState.QUIT
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at a menu prompt; running operations handle their own cancel
             self.state = AppState.CHAT
 
 
 def main():
     """Entry point for the application."""
     app = ModelChatCLI()
-    asyncio.run(app.run())
+    try:
+        asyncio.run(app.run())
+    except KeyboardInterrupt:
+        # Ctrl+C landed outside any handled prompt/operation
+        print("\nGoodbye!")
 
 
 if __name__ == "__main__":

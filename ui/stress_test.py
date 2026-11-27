@@ -1,5 +1,6 @@
 """Stress test view for load testing AI models."""
 import asyncio
+import time
 from typing import List
 from rich.console import Console
 from rich.panel import Panel
@@ -11,6 +12,67 @@ from rich.prompt import IntPrompt, Prompt
 
 from stress_tester import StressTester, TestResult, TestStats
 from ui.components import format_menu_item
+from ui.interrupt import run_interruptible
+
+
+class _ResultsGrid:
+    """Width/height-aware grid of request cells for the live dashboard.
+
+    Sizes itself from the space Rich gives it at render time, shows only the
+    newest results that fit, and never wraps a cell, so the dashboard keeps a
+    fixed shape at any terminal size.
+    """
+
+    CELL_MIN_W = 24
+    CELL_H = 4  # border + 2 text lines + border
+
+    # Single-width glyphs only (emoji like ⏸ ⏳ are double-width in many terminals)
+    ICONS = {"pending": ("\u00b7", "chrome"), "running": ("\u25cf", "status.running"),
+             "success": ("\u2713", "status.ok"), "error": ("\u2717", "status.error")}
+
+    def __init__(self, results: List[TestResult]):
+        self.results = results
+
+    def _cell(self, r: TestResult) -> Panel:
+        icon, style = self.ICONS.get(r.status, ("?", "chrome"))
+        text = Text(no_wrap=True, overflow="ellipsis")
+        text.append(f"#{r.request_id} ", style="accent.bold")
+        text.append(icon, style=style)
+        text.append("\n")
+        if r.status == "success":
+            text.append(f"{r.duration:.1f}s {r.decode_tps:.0f}t/s", style="metric.label")
+            if r.ttft > 0:
+                text.append(f" ttft {r.ttft:.2f}s", style="chrome")
+        elif r.status == "error":
+            text.append(r.error_msg or "error", style="status.error")
+        elif r.status == "running":
+            text.append("streaming...", style="status.running")
+        else:
+            text.append("waiting...", style="chrome")
+        return Panel(text, height=self.CELL_H, padding=(0, 1), border_style="chrome.border")
+
+    def __rich_console__(self, console, options):
+        width = options.max_width
+        height = options.height or options.max_height or console.height
+        inner_w = max(1, width - 2)
+        inner_h = max(1, height - 2)
+        cols = max(1, inner_w // self.CELL_MIN_W)
+        rows = max(1, inner_h // self.CELL_H)
+        shown = self.results[-(cols * rows):]
+
+        if not shown:
+            body = Text("Waiting for results...", style="chrome")
+        else:
+            body = Table.grid(expand=True)
+            for _ in range(cols):
+                body.add_column(ratio=1, no_wrap=True)
+            for i in range(0, len(shown), cols):
+                cells = [self._cell(r) for r in shown[i:i + cols]]
+                cells += [Text("")] * (cols - len(cells))
+                body.add_row(*cells)
+
+        yield Panel(body, title=f"Conversations ({len(shown)} of {len(self.results)})",
+                    height=height, padding=(0, 0))
 
 
 class StressTestView:
@@ -97,10 +159,14 @@ class StressTestView:
         elif mode == 6:
             await self._run_tool_bench_mode()
 
-        self._show_summary()
+        if self.current_results or self.current_stats.total:
+            self._show_summary()
 
-        self.console.print("\n  [chrome]Press Enter to return to chat...[/chrome]")
-        input()
+        try:
+            Prompt.ask("\n  [chrome]Press Enter to return to chat[/chrome]",
+                       default="", show_default=False)
+        except (KeyboardInterrupt, EOFError):
+            pass
 
         return "back"
 
@@ -146,30 +212,11 @@ class StressTestView:
         self.console.print(f"\n  [status.info]Starting test with {num_requests} concurrent requests...[/status.info]")
         self.console.print(f"  [chrome]{self.server['url']} | {self.model}[/chrome]\n")
 
-        try:
-            layout = self._create_layout(f"Throughput Test | {num_requests} concurrent")
-
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next((r for r in self.current_results if r.request_id == result.request_id), None)
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_throughput_test(
-                    num_requests, update_callback=update_callback
-                )
-
-            self.current_results = self.tester.results
-
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+        await self._run_live(
+            f"Throughput Test | {num_requests} concurrent",
+            lambda cb: self.tester.run_throughput_test(
+                    num_requests, update_callback=cb),
+        )
 
     async def _run_token_stress_mode(self):
         """Run token stress test mode."""
@@ -196,30 +243,11 @@ class StressTestView:
         self.console.print(f"\n  [status.info]Starting test with token sizes: {token_sizes}...[/status.info]")
         self.console.print(f"  [chrome]{self.server['url']} | {self.model}[/chrome]\n")
 
-        try:
-            layout = self._create_layout(f"Token Stress Test | {len(token_sizes)} sizes")
-
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next((r for r in self.current_results if r.request_id == result.request_id), None)
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_token_stress_test(
-                    token_sizes, update_callback=update_callback
-                )
-
-            self.current_results = self.tester.results
-
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+        await self._run_live(
+            f"Token Stress Test | {len(token_sizes)} sizes",
+            lambda cb: self.tester.run_token_stress_test(
+                    token_sizes, update_callback=cb),
+        )
 
     async def _run_sustained_load_mode(self):
         """Run sustained load test mode."""
@@ -243,30 +271,11 @@ class StressTestView:
         self.console.print(f"\n  [status.info]Starting: {duration}min @ {rate} req/min ({total_requests} total)...[/status.info]")
         self.console.print(f"  [chrome]{self.server['url']} | {self.model}[/chrome]\n")
 
-        try:
-            layout = self._create_layout(f"Sustained Load | {duration}min @ {rate}/min")
-
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next((r for r in self.current_results if r.request_id == result.request_id), None)
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_sustained_load_test(
-                    duration, rate, update_callback=update_callback
-                )
-
-            self.current_results = self.tester.results
-
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+        await self._run_live(
+            f"Sustained Load | {duration}min @ {rate}/min",
+            lambda cb: self.tester.run_sustained_load_test(
+                    duration, rate, update_callback=cb),
+        )
 
     async def _run_consistency_mode(self):
         """Run consistency test mode — same prompt N times, serial."""
@@ -297,30 +306,11 @@ class StressTestView:
             self.console.print(f"  [chrome]Notes: {notes}[/chrome]")
         self.console.print()
 
-        try:
-            layout = self._create_layout(f"Consistency | {iterations} runs")
-
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next((r for r in self.current_results if r.request_id == result.request_id), None)
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_consistency_test(
-                    prompt, iterations, notes, update_callback=update_callback
-                )
-
-            self.current_results = self.tester.results
-
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+        await self._run_live(
+            f"Consistency | {iterations} runs",
+            lambda cb: self.tester.run_consistency_test(
+                    prompt, iterations, notes, update_callback=cb),
+        )
 
     async def _run_realistic_user_mode(self):
         """Run realistic user test — Poisson arrivals × multi-turn sessions."""
@@ -377,37 +367,15 @@ class StressTestView:
         )
         self.console.print(f"  [chrome]{self.server['url']} | {self.model}[/chrome]\n")
 
-        try:
-            layout = self._create_layout(
-                f"Realistic User | {duration}min \u00b7 ~{mean_rpm} sess/min \u00b7 ~{mean_session_turns:.0f} turns"
-            )
-
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next((r for r in self.current_results if r.request_id == result.request_id), None)
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_realistic_user_test(
+        await self._run_live(
+            f"Realistic User | {duration}min \u00b7 ~{mean_rpm} sess/min \u00b7 ~{mean_session_turns:.0f} turns",
+            lambda cb: self.tester.run_realistic_user_test(
                     duration_minutes=duration,
                     mean_rpm=mean_rpm,
                     max_tokens_cap=max_tokens_cap,
                     prompt_mix=prompt_mix,
-                    mean_session_turns=mean_session_turns,
-                    update_callback=update_callback,
-                )
-
-            self.current_results = self.tester.results
-
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+                    mean_session_turns=mean_session_turns, update_callback=cb),
+        )
 
     async def _run_tool_bench_mode(self):
         """Run the agentic tool-calling benchmark."""
@@ -447,35 +415,13 @@ class StressTestView:
         )
         self.console.print(f"  [chrome]{self.server['url']} | {self.model}[/chrome]\n")
 
-        try:
-            layout = self._create_layout(
-                f"Tool Bench | {n_tasks} tasks · conc={concurrency}"
-            )
-            with Live(layout, console=self.console, refresh_per_second=4) as live:
-                async def update_callback(result: TestResult):
-                    existing = next(
-                        (r for r in self.current_results if r.request_id == result.request_id),
-                        None,
-                    )
-                    if existing:
-                        idx = self.current_results.index(existing)
-                        self.current_results[idx] = result
-                    else:
-                        self.current_results.append(result)
-                    self._update_layout(layout, self.tester.stats)
-
-                self.current_stats = await self.tester.run_tool_bench_test(
+        await self._run_live(
+            f"Tool Bench | {n_tasks} tasks · conc={concurrency}",
+            lambda cb: self.tester.run_tool_bench_test(
                     subset=subset,
                     concurrency=concurrency,
-                    max_tokens_per_step=max_tokens_per_step,
-                    update_callback=update_callback,
-                )
-            self.current_results = self.tester.results
-        except Exception as e:
-            self.console.print(f"\n  [status.error]Test failed: {type(e).__name__} - {str(e)}[/status.error]")
-            import traceback
-            self.console.print(f"  [chrome]{traceback.format_exc()}[/chrome]")
-            raise
+                    max_tokens_per_step=max_tokens_per_step, update_callback=cb),
+        )
 
     def _pick_prompt(self) -> str:
         """Pick one fixed prompt from the bank. Returns None on cancel."""
@@ -516,13 +462,67 @@ class StressTestView:
 
         return bank[idx]
 
+    async def _run_live(self, title: str, start_test):
+        """Run a test under a full-screen live dashboard.
+
+        `start_test(update_callback)` returns the tester coroutine. The
+        dashboard uses the terminal's alternate screen so the full-height
+        layout can't scroll or leave duplicate frames; the summary prints to
+        the normal screen afterwards. Ctrl+C stops the test and keeps the
+        results gathered so far.
+        """
+        self.current_results = []
+        self.stopped_early = False
+        layout = self._create_layout(f"{title}   [chrome](Ctrl+C to stop)[/chrome]")
+        by_id = {}
+        wall_start = time.monotonic()
+
+        async def update_callback(result: TestResult):
+            # Only record state here; Live repaints on its own timer
+            if result.request_id not in by_id:
+                by_id[result.request_id] = len(self.current_results)
+                self.current_results.append(result)
+            else:
+                self.current_results[by_id[result.request_id]] = result
+            self._update_layout(layout, self.tester.stats)
+
+        error = None
+        try:
+            with Live(layout, console=self.console, screen=True,
+                      refresh_per_second=4, redirect_stdout=True, redirect_stderr=True):
+                stats, interrupted = await run_interruptible(start_test(update_callback))
+        except Exception as e:
+            stats, interrupted, error = None, False, e
+
+        if error is not None:
+            self.console.print(Text(f"\n  Test failed: {type(error).__name__} - {error}",
+                                    style="status.error"))
+            self.console.print("  [chrome]Details are in the logs/ directory.[/chrome]")
+
+        if stats is not None and not interrupted:
+            self.current_stats = stats
+            self.current_results = self.tester.results
+            return
+
+        # Stopped early (Ctrl+C) or failed: summarize what finished
+        self.stopped_early = True
+        finished = [r for r in self.current_results if r.status in ("success", "error")]
+        # Rates are over finished requests, not the ones cut off mid-flight
+        self.tester.stats.total = len(finished)
+        self.tester._compute_stats(finished, time.monotonic() - wall_start)
+        self.current_stats = self.tester.stats
+        self.current_results = finished
+        if interrupted:
+            self.console.print(f"\n  [status.warn]Stopped early — {len(finished)} finished "
+                               f"request(s) summarized.[/status.warn]")
+
     def _create_layout(self, title: str) -> Layout:
         """Create layout for stress test display."""
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=3),
             Layout(name="main", ratio=3),
-            Layout(name="footer", ratio=1)
+            Layout(name="footer", ratio=1, minimum_size=8)
         )
         layout["main"].split_row(
             Layout(name="conversations", ratio=2),
@@ -530,7 +530,7 @@ class StressTestView:
         )
 
         layout["header"].update(Panel(title, style="accent.bold"))
-        layout["conversations"].update(Panel("[chrome]Waiting for results...[/chrome]", title="Conversations"))
+        layout["conversations"].update(_ResultsGrid(self.current_results))
         layout["errors"].update(Panel("[chrome]No errors yet[/chrome]", title="Error Log"))
         layout["footer"].update(self._create_stats_panel(TestStats()))
 
@@ -538,67 +538,9 @@ class StressTestView:
 
     def _update_layout(self, layout: Layout, stats: TestStats):
         """Update layout with current results."""
-        layout["conversations"].update(self._create_conversations_panel())
+        layout["conversations"].update(_ResultsGrid(self.current_results))
         layout["footer"].update(self._create_stats_panel(stats))
         layout["errors"].update(self._create_errors_panel(stats))
-
-    def _create_conversations_panel(self) -> Panel:
-        """Create panel showing conversation status."""
-        if not self.current_results:
-            return Panel("[chrome]No conversations yet...[/chrome]", title="Conversations")
-
-        max_display = 24
-        display_results = self.current_results[-max_display:]
-
-        table = Table.grid(padding=(0, 1))
-        table.add_column(justify="left")
-        table.add_column(justify="left")
-        table.add_column(justify="left")
-
-        for i in range(0, len(display_results), 3):
-            row_results = display_results[i:i+3]
-            cells = []
-
-            for result in row_results:
-                status_icon = {
-                    "pending": "\u23f8",
-                    "running": "\u23f3",
-                    "success": "\u2713",
-                    "error": "\u2717"
-                }.get(result.status, "?")
-
-                status_style = {
-                    "pending": "chrome",
-                    "running": "status.running",
-                    "success": "status.ok",
-                    "error": "status.error"
-                }.get(result.status, "chrome")
-
-                cell = Text()
-                cell.append(f"#{result.request_id} ", style="accent.bold")
-                cell.append(status_icon, style=status_style)
-                cell.append("\n", style="chrome")
-
-                if result.status == "success":
-                    cell.append(f"{result.duration:.1f}s  {result.decode_tps:.0f} t/s", style="metric.label")
-                    if result.ttft > 0:
-                        cell.append(f"  TTFT {result.ttft:.2f}s", style="chrome")
-                elif result.status == "error":
-                    error_short = result.error_msg[:22] + "..." if len(result.error_msg) > 22 else result.error_msg
-                    cell.append(error_short, style="status.error")
-                elif result.status == "running":
-                    cell.append("streaming...", style="status.running")
-                else:
-                    cell.append("waiting...", style="chrome")
-
-                cells.append(Panel(cell, width=28, height=5))
-
-            while len(cells) < 3:
-                cells.append(Panel("", width=28, height=5, border_style="chrome.border"))
-
-            table.add_row(*cells)
-
-        return Panel(table, title=f"Conversations ({len(display_results)} of {len(self.current_results)})")
 
     def _create_stats_panel(self, stats: TestStats) -> Panel:
         """Create statistics panel."""
@@ -636,7 +578,10 @@ class StressTestView:
     def _show_summary(self):
         """Show test summary."""
         s = self.current_stats
-        self.console.print("\n  [status.ok]Test Complete[/status.ok]\n")
+        if getattr(self, "stopped_early", False):
+            self.console.print("\n  [status.warn]Partial Results (stopped early)[/status.warn]\n")
+        else:
+            self.console.print("\n  [status.ok]Test Complete[/status.ok]\n")
 
         # Tool-bench specific summary takes over the entire output for that mode
         if s and getattr(s, "tasks_total", 0) > 0:

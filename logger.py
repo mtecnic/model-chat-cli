@@ -22,14 +22,18 @@ def setup_logger(name: str = "model_chat_cli", log_to_file: bool = True) -> logg
     if logger.handlers:
         return logger
 
-    # Console handler - INFO and above
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_formatter = logging.Formatter(
-        '[%(levelname)s] %(message)s'
-    )
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
+    # Don't bubble up to the root logger (which may print to the terminal)
+    logger.propagate = False
+
+    # Console output is opt-in: a StreamHandler holds the real stderr and
+    # writes straight through Rich Live displays, corrupting them (the
+    # stress-test view would scroll/duplicate frames). The UI already shows
+    # errors in its own panels; everything goes to the log file.
+    if os.environ.get("MODEL_CHAT_DEBUG"):
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+        logger.addHandler(console_handler)
 
     # File handler - DEBUG and above
     if log_to_file:

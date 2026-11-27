@@ -131,10 +131,10 @@ Pick a clear winner. Ties are cop-outs."""
 
 JUDGE_TEMPLATE = """Question: {question}
 
-Response A ({prompt_a}):
+Response A:
 {response_a}
 
-Response B ({prompt_b}):
+Response B:
 {response_b}
 
 Evaluate each response. Reply with ONLY this JSON:
@@ -211,8 +211,8 @@ class JudgeResult:
     prompt_a: str
     prompt_b: str
     winner: str  # "A", "B", or "TIE"
-    score_a: int = 0
-    score_b: int = 0
+    score_a: float = 0
+    score_b: float = 0
     confidence: str = "medium"
     explanation: str = ""
 
@@ -232,7 +232,7 @@ class ArenaResult:
     responses: List[PromptResponse] = field(default_factory=list)
     matchups: List[ArenaMatchup] = field(default_factory=list)
     rankings: Dict[str, float] = field(default_factory=dict)  # prompt_key -> wins (float for ties)
-    scores: Dict[str, List[int]] = field(default_factory=dict)  # prompt_key -> list of scores
+    scores: Dict[str, List[float]] = field(default_factory=dict)  # prompt_key -> list of scores
     winner: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -279,6 +279,9 @@ class PromptArena:
         self.server = server
         self.model = model
         self.client = ModelClient(server, model)
+        # Judge defaults to the same model (self-evaluation); set_judge() overrides
+        self.judge_client = self.client
+        self.judge_label = "self-judge"
         self.logger = setup_logger("prompt_arena")
 
         # Copy default prompts (allow modifications)
@@ -287,6 +290,17 @@ class PromptArena:
         # Current state
         self.current_responses: List[PromptResponse] = []
         self.stats = ArenaStats()
+
+    # Max concurrent judge requests (each pair is judged twice)
+    JUDGE_CONCURRENCY = 4
+
+    def set_judge(self, server: Dict[str, Any], model: str) -> None:
+        """Use a different model as the judge."""
+        if server["url"] == self.server["url"] and model == self.model:
+            self.judge_client, self.judge_label = self.client, "self-judge"
+        else:
+            self.judge_client = ModelClient(server, model)
+            self.judge_label = f"{model} @ {server['ip']}:{server['port']}"
 
     def add_custom_prompt(self, key: str, name: str, prompt: str) -> bool:
         """Add a custom system prompt to the arena."""
@@ -395,35 +409,77 @@ class PromptArena:
         self.current_responses = responses
         return responses
 
-    async def judge_pair(
+    async def _judge_once(
         self,
-        response_a: PromptResponse,
-        response_b: PromptResponse
+        first: PromptResponse,
+        second: PromptResponse,
+        semaphore: Optional[asyncio.Semaphore] = None,
     ) -> JudgeResult:
-        """Have the model judge which response is better."""
+        """One judge call with `first` shown as Response A. Names are hidden."""
         judge_prompt = JUDGE_TEMPLATE.format(
-            question=response_a.question,
-            prompt_a=response_a.prompt_name,
-            response_a=response_a.response,
-            prompt_b=response_b.prompt_name,
-            response_b=response_b.response
+            question=first.question,
+            response_a=first.response,
+            response_b=second.response,
         )
-
         messages = [{"role": "system", "content": JUDGE_SYSTEM}]
 
         try:
-            result = await self.client.chat(judge_prompt, messages)
+            if semaphore:
+                async with semaphore:
+                    result = await self.judge_client.chat(judge_prompt, messages)
+            else:
+                result = await self.judge_client.chat(judge_prompt, messages)
             result = strip_thinking(result)
-            return self._parse_judge_result(result, response_a, response_b)
+            return self._parse_judge_result(result, first, second)
         except Exception as e:
             self.logger.error(f"Judge error: {e}")
             return JudgeResult(
-                prompt_a=response_a.prompt_key,
-                prompt_b=response_b.prompt_key,
+                prompt_a=first.prompt_key,
+                prompt_b=second.prompt_key,
                 winner="TIE",
                 confidence="low",
                 explanation=f"Judge error: {e}"
             )
+
+    async def judge_pair(
+        self,
+        response_a: PromptResponse,
+        response_b: PromptResponse,
+        semaphore: Optional[asyncio.Semaphore] = None,
+    ) -> JudgeResult:
+        """Judge a pair in both orders to cancel out position bias.
+
+        Agreeing verdicts count; if the judge flips when the order is swapped
+        it's a tie. Scores are averaged across both orders.
+        """
+        forward, backward = await asyncio.gather(
+            self._judge_once(response_a, response_b, semaphore),
+            self._judge_once(response_b, response_a, semaphore),
+        )
+        # Express the backward verdict relative to response_a/response_b
+        flipped = {"A": "B", "B": "A"}.get(backward.winner, "TIE")
+
+        if forward.winner == flipped:
+            winner = forward.winner
+            explanation = forward.explanation
+            levels = ["low", "medium", "high"]
+            confidence = min(forward.confidence, backward.confidence,
+                             key=lambda c: levels.index(c) if c in levels else 0)
+        else:
+            winner = "TIE"
+            confidence = "low"
+            explanation = ("Verdict changed when the response order was swapped "
+                           "(position bias) — counted as a tie.")
+
+        return JudgeResult(
+            prompt_a=response_a.prompt_key,
+            prompt_b=response_b.prompt_key,
+            winner=winner,
+            score_a=(forward.score_a + backward.score_b) / 2,
+            score_b=(forward.score_b + backward.score_a) / 2,
+            confidence=confidence,
+            explanation=explanation,
+        )
 
     def _parse_judge_result(
         self,
@@ -438,16 +494,19 @@ class PromptArena:
             end = result.rfind("}") + 1
             if start >= 0 and end > start:
                 data = json.loads(result[start:end])
+                winner = str(data.get("winner", "TIE")).strip().upper()
+                if winner not in ("A", "B"):
+                    winner = "TIE"
                 return JudgeResult(
                     prompt_a=response_a.prompt_key,
                     prompt_b=response_b.prompt_key,
-                    winner=data.get("winner", "TIE"),
-                    score_a=int(data.get("score_a", 5)),
-                    score_b=int(data.get("score_b", 5)),
+                    winner=winner,
+                    score_a=float(data.get("score_a", 5)),
+                    score_b=float(data.get("score_b", 5)),
                     confidence=data.get("confidence", "medium"),
                     explanation=data.get("explanation", "")
                 )
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             self.logger.warning(f"JSON parse error: {e}")
 
         # Fallback: try to extract winner from text
@@ -487,11 +546,11 @@ class PromptArena:
             self.logger.warning("Not enough successful responses for tournament")
             return result
 
-        # Phase 2: Round-robin judging
-        matchups = []
+        # Phase 2: Round-robin judging, pairs judged concurrently
         rankings: Dict[str, float] = {r.prompt_key: 0.0 for r in successful}
-        scores: Dict[str, List[int]] = {r.prompt_key: [] for r in successful}
+        scores: Dict[str, List[float]] = {r.prompt_key: [] for r in successful}
 
+        pairs = []
         for i, resp_a in enumerate(successful):
             for resp_b in successful[i+1:]:
                 # Skip judging if either response is empty
@@ -500,30 +559,37 @@ class PromptArena:
                         f"Skipping matchup {resp_a.prompt_key} vs {resp_b.prompt_key}: empty response"
                     )
                     continue
+                pairs.append((resp_a, resp_b))
 
-                judge_result = await self.judge_pair(resp_a, resp_b)
-                matchup = ArenaMatchup(
-                    response_a=resp_a,
-                    response_b=resp_b,
-                    judge_result=judge_result
-                )
-                matchups.append(matchup)
+        semaphore = asyncio.Semaphore(self.JUDGE_CONCURRENCY)
 
-                # Update rankings
-                if judge_result.winner == "A":
-                    rankings[resp_a.prompt_key] += 1
-                elif judge_result.winner == "B":
-                    rankings[resp_b.prompt_key] += 1
-                else:  # TIE
-                    rankings[resp_a.prompt_key] += 0.5
-                    rankings[resp_b.prompt_key] += 0.5
+        async def judge(resp_a, resp_b) -> ArenaMatchup:
+            matchup = ArenaMatchup(
+                response_a=resp_a,
+                response_b=resp_b,
+                judge_result=await self.judge_pair(resp_a, resp_b, semaphore),
+            )
+            if update_callback:
+                await update_callback(matchup)
+            return matchup
 
-                # Update scores
+        # gather keeps pair order, so results are deterministic to read
+        matchups = list(await asyncio.gather(*(judge(a, b) for a, b in pairs)))
+
+        for matchup in matchups:
+            judge_result = matchup.judge_result
+            resp_a, resp_b = matchup.response_a, matchup.response_b
+            if judge_result.winner == "A":
+                rankings[resp_a.prompt_key] += 1
+            elif judge_result.winner == "B":
+                rankings[resp_b.prompt_key] += 1
+            else:  # TIE
+                rankings[resp_a.prompt_key] += 0.5
+                rankings[resp_b.prompt_key] += 0.5
+            # Failed judge parses carry no scores (0); keep them out of averages
+            if judge_result.score_a or judge_result.score_b:
                 scores[resp_a.prompt_key].append(judge_result.score_a)
                 scores[resp_b.prompt_key].append(judge_result.score_b)
-
-                if update_callback:
-                    await update_callback(matchup)
 
         result.matchups = matchups
         result.rankings = rankings  # Keep as floats to preserve tie scores (0.5)
@@ -531,8 +597,11 @@ class PromptArena:
 
         # Determine winner
         if rankings:
-            winner_key = max(rankings.keys(), key=lambda k: (rankings[k], result.get_avg_score(k)))
-            result.winner = winner_key
+            rank_key = lambda k: (rankings[k], result.get_avg_score(k))
+            winner_key = max(rankings.keys(), key=rank_key)
+            # A tie for first place is not a win
+            tied = [k for k in rankings if rank_key(k) == rank_key(winner_key)]
+            result.winner = winner_key if len(tied) == 1 else ""
 
         self.logger.info(f"Tournament complete. Winner: {result.winner}")
         return result
